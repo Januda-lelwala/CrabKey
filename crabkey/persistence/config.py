@@ -44,3 +44,18 @@ class ProjectConfig:
     @classmethod
     def from_project_dir(cls, project_root: Path) -> "ProjectConfig":
         return cls.load(project_root / ".crabkey" / "config.toml")
+
+    def save(self, path: Path) -> None:
+        """Write this config to a TOML file, creating parent dirs as needed."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = [
+            f'provider = "{self.provider}"',
+            f'model    = "{self.model}"',
+            f'max_tokens = {self.max_tokens}',
+        ]
+        for key, value in self.extra.items():
+            if isinstance(value, str):
+                lines.append(f'{key} = "{value}"')
+            else:
+                lines.append(f"{key} = {value!r}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")

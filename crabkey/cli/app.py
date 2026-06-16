@@ -229,6 +229,16 @@ def list_models_cmd(
 
 
 @app.command()
+def configure(
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+    global_: bool = typer.Option(False, "--global", "-g", help="Write to ~/.config/crabkey/config.toml instead of .crabkey/config.toml."),
+) -> None:
+    """Interactive wizard to select a provider, set an API key, and pick a model."""
+    from .configure import run_configure
+    run_configure(cwd, global_config=global_)
+
+
+@app.command()
 def chat(
     session: Optional[str] = typer.Option(None, "--session", "-s", help="Session name to resume or create."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
