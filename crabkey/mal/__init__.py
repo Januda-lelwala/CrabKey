@@ -18,9 +18,6 @@ from .model_catalog import (
     get_provider_info, fetch_models_dev,
 )
 
-# Legacy adapters — kept for backward compatibility
-from .adapters import AnthropicAdapter, LocalAdapter, OpenAIAdapter, OpenRouterAdapter
-
 __all__ = [
     # Core message types
     "CompletionResponse", "Message", "Role", "ToolCall", "ToolResult", "Usage",
@@ -38,7 +35,5 @@ __all__ = [
     # Model catalog
     "ModelInfo", "ProviderInfo", "get_model_info", "list_agentic_models",
     "get_provider_info", "fetch_models_dev",
-    # Legacy adapters
-    "AnthropicAdapter", "OpenAIAdapter", "OpenRouterAdapter", "LocalAdapter",
 ]
 

@@ -140,7 +140,7 @@ class PluginModelProvider(ModelProvider):
                 raise ImportError("Install 'openai' to use OpenAI-compatible providers.") from exc
             self._client = openai.AsyncOpenAI(
                 api_key=self._api_key or "no-key",
-                base_url=self._profile.base_url or None,
+                base_url=self._profile.get_base_url() or None,
             )
         return self._client
 
@@ -169,23 +169,42 @@ class PluginModelProvider(ModelProvider):
             for t in tools
         ]
 
+    def _base_params(self, config: ModelConfig, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build the common params dict passed to every transport.build_kwargs() call."""
+        params: dict[str, Any] = {
+            "provider_profile": self._profile,
+            "max_tokens": config.max_tokens,
+            "temperature": config.temperature,
+            "base_url": self._profile.get_base_url(),
+        }
+        if extra:
+            params.update(extra)
+        return params
+
     async def complete(
         self,
         messages: list[Message],
         config: ModelConfig,
         tools: list[ToolSchema] | None = None,
+        *,
+        provider_preferences: dict[str, Any] | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> CompletionResponse:
         client = self._get_client()
         wire_messages = _messages_to_openai_wire(messages)
         wire_tools = self._tool_schemas_to_wire(tools)
 
+        params = self._base_params(config, {
+            "provider_preferences": provider_preferences,
+            "reasoning_config": reasoning_config,
+            "session_id": session_id,
+        })
         kwargs = self._transport.build_kwargs(
             model=config.model,
             messages=wire_messages,
             tools=wire_tools,
-            provider_profile=self._profile,
-            max_tokens=config.max_tokens,
-            temperature=config.temperature,
+            **params,
         )
 
         if self._profile.api_mode == "anthropic_messages":
@@ -201,28 +220,30 @@ class PluginModelProvider(ModelProvider):
         messages: list[Message],
         config: ModelConfig,
         tools: list[ToolSchema] | None = None,
+        *,
+        provider_preferences: dict[str, Any] | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[str]:
         client = self._get_client()
         wire_messages = _messages_to_openai_wire(messages)
 
+        params = self._base_params(config, {
+            "provider_preferences": provider_preferences,
+            "reasoning_config": reasoning_config,
+            "session_id": session_id,
+        })
+        kwargs = self._transport.build_kwargs(
+            model=config.model,
+            messages=wire_messages,
+            **params,
+        )
+
         if self._profile.api_mode == "anthropic_messages":
-            kwargs = self._transport.build_kwargs(
-                model=config.model,
-                messages=wire_messages,
-                provider_profile=self._profile,
-                max_tokens=config.max_tokens,
-            )
-            async with client.messages.stream(**kwargs) as stream:
-                async for text in stream.text_stream:
+            async with client.messages.stream(**kwargs) as stream_ctx:
+                async for text in stream_ctx.text_stream:
                     yield text
         else:
-            kwargs = self._transport.build_kwargs(
-                model=config.model,
-                messages=wire_messages,
-                provider_profile=self._profile,
-                max_tokens=config.max_tokens,
-                temperature=config.temperature,
-            )
             kwargs["stream"] = True
             async for chunk in await client.chat.completions.create(**kwargs):
                 delta = chunk.choices[0].delta.content if chunk.choices else None

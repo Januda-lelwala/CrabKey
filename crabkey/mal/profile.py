@@ -45,7 +45,6 @@ class ProviderProfile:
 
     # ── Vision support ────────────────────────────────────────────
     supports_vision: bool = False
-    supports_vision_tool_messages: bool = True
 
     # ── Model catalog ─────────────────────────────────────────────
     # Curated fallback list shown when live fetch fails.
@@ -66,13 +65,18 @@ class ProviderProfile:
 
     # ── Hooks (override in subclass for complex providers) ────────
 
+    def get_base_url(self) -> str:
+        """Return the base URL for this provider. Override for dynamic resolution."""
+        return self.base_url
+
     def get_hostname(self) -> str:
         """Return base hostname for URL-based provider detection."""
         if self.hostname:
             return self.hostname
-        if self.base_url:
+        url = self.get_base_url()
+        if url:
             from urllib.parse import urlparse
-            return urlparse(self.base_url).hostname or ""
+            return urlparse(url).hostname or ""
         return ""
 
     def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

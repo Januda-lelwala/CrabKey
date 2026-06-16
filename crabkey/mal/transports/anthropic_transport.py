@@ -93,12 +93,26 @@ class AnthropicMessagesTransport(ProviderTransport):
         tools: list[dict[str, Any]] | None = None,
         **params: Any,
     ) -> dict[str, Any]:
+        profile = params.get("provider_profile")
+
+        # Run provider-specific message preprocessing if a profile is present.
+        if profile is not None:
+            messages = profile.prepare_messages(messages)
+
         system, anthropic_messages = self.convert_messages(messages)
+
+        # max_tokens: ephemeral > user-set > profile default > hard minimum
+        max_tokens = (
+            params.get("ephemeral_max_tokens")
+            or params.get("max_tokens")
+            or (profile.get_max_tokens(model) if profile else None)
+            or 8192
+        )
 
         api_kwargs: dict[str, Any] = {
             "model": model,
             "messages": anthropic_messages,
-            "max_tokens": params.get("max_tokens") or 8192,
+            "max_tokens": max_tokens,
         }
         if system:
             api_kwargs["system"] = system
@@ -106,6 +120,28 @@ class AnthropicMessagesTransport(ProviderTransport):
             api_kwargs["tools"] = self.convert_tools(tools)
         if (temp := params.get("temperature")) is not None:
             api_kwargs["temperature"] = temp
+
+        if profile is not None:
+            # Provider-specific top-level extras (reasoning effort, metadata, etc.)
+            extra_body_from_profile, top_level = profile.build_api_kwargs_extras(
+                reasoning_config=params.get("reasoning_config"),
+                supports_reasoning=params.get("supports_reasoning", False),
+                model=model,
+                session_id=params.get("session_id"),
+            )
+            api_kwargs.update(top_level)
+
+            # Merge any extra_body additions into betas / system-level params.
+            profile_body = profile.build_extra_body(
+                session_id=params.get("session_id"),
+                model=model,
+                reasoning_config=params.get("reasoning_config"),
+            )
+            if profile_body:
+                api_kwargs.setdefault("extra_body", {}).update(profile_body)
+            if extra_body_from_profile:
+                api_kwargs.setdefault("extra_body", {}).update(extra_body_from_profile)
+
         return api_kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
