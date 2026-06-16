@@ -22,6 +22,7 @@ from ..mal.provider_registry import get_provider_profile, list_providers
 from ..orchestration.hook_dispatcher import HookDispatcher
 from ..orchestration.loop_engine import LoopConfig, LoopEngine, StepEvent
 from ..orchestration.planner import Planner
+from ..orchestration.session_manager import SessionManager
 from ..orchestration.thread_manager import ThreadManager
 from ..persistence.config import ProjectConfig
 from ..persistence.db import Db
@@ -225,6 +226,74 @@ def list_models_cmd(
     for m in models:
         console.print(f"  {m}")
     console.print()
+
+
+@app.command()
+def chat(
+    session: Optional[str] = typer.Option(None, "--session", "-s", help="Session name to resume or create."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
+    allow_all: bool = typer.Option(False, "--allow-all", help="Grant ALLOW to all tools."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+) -> None:
+    """Start an interactive chat session with session and thread support."""
+    asyncio.run(_chat_async(session, model, provider, allow_all, cwd))
+
+
+async def _chat_async(
+    session_name: str | None,
+    model_override: str | None,
+    provider_override: str | None,
+    allow_all: bool,
+    cwd: Path,
+) -> None:
+    from .repl import ConversationContext, Repl
+
+    config_dir, project_config, db_path = _resolve_project(cwd)
+
+    if provider_override:
+        project_config.provider = provider_override
+    if model_override:
+        project_config.model = model_override
+
+    provider = _make_provider(project_config)
+    db = Db(db_path)
+    await db.initialize()
+
+    session_mgr = SessionManager(db)
+    thread_mgr = ThreadManager(db)
+
+    # Resume or create a session
+    if session_name:
+        try:
+            await session_mgr.switch(session_name)
+            console.print(f"[dim]Resumed session [cyan]{session_name}[/cyan][/dim]")
+        except KeyError:
+            sess = await session_mgr.new(session_name)
+            console.print(f"[dim]Created session [cyan]{sess.name}[/cyan][/dim]")
+    else:
+        sess = await session_mgr.new()
+        console.print(f"[dim]Started session [cyan]{sess.name}[/cyan]  — use /session new <name> to name it[/dim]")
+
+    model_config = ModelConfig(
+        model=project_config.model,
+        max_tokens=project_config.max_tokens,
+        system=(
+            "You are CrabKey, an agentic coding assistant. "
+            "Be concise, precise, and helpful."
+        ),
+    )
+
+    ctx = ConversationContext(session_mgr, thread_mgr, db)
+    repl = Repl(
+        ctx=ctx,
+        session_mgr=session_mgr,
+        thread_mgr=thread_mgr,
+        provider=provider,
+        model_config=model_config,
+        console=console,
+    )
+    await repl.run()
 
 
 def main() -> None:
