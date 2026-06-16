@@ -1,0 +1,4 @@
+name: groq-provider
+kind: model-provider
+version: 1.0.0
+description: Groq (ultra-fast Llama / Gemma inference)

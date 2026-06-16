@@ -1,0 +1,4 @@
+name: openrouter-provider
+kind: model-provider
+version: 1.0.0
+description: OpenRouter (200+ models)

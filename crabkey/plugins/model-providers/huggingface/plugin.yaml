@@ -1,0 +1,4 @@
+name: huggingface-provider
+kind: model-provider
+version: 1.0.0
+description: Hugging Face Inference API

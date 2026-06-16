@@ -1,0 +1,4 @@
+name: openai-provider
+kind: model-provider
+version: 1.0.0
+description: OpenAI (GPT-4o, o3, etc.)

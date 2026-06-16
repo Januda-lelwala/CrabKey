@@ -16,8 +16,9 @@ from rich.text import Text
 from ..cognition.context_assembler import ContextAssembler
 from ..cognition.memory_manager import MemoryManager
 from ..cognition.reflector import Reflector
-from ..mal.adapters.anthropic import AnthropicAdapter
+from ..mal.plugin_provider import PluginModelProvider
 from ..mal.provider import ModelConfig
+from ..mal.provider_registry import get_provider_profile, list_providers
 from ..orchestration.hook_dispatcher import HookDispatcher
 from ..orchestration.loop_engine import LoopConfig, LoopEngine, StepEvent
 from ..orchestration.planner import Planner
@@ -45,19 +46,16 @@ def _resolve_project(cwd: Path) -> tuple[Path, ProjectConfig, Path]:
     return config_dir, config, db_path
 
 
-def _make_provider(config: ProjectConfig):
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if config.provider == "anthropic":
-        return AnthropicAdapter(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
-    if config.provider in ("openai", "openrouter"):
-        from ..mal.adapters.openai import OpenAIAdapter, OpenRouterAdapter
-        if config.provider == "openrouter":
-            return OpenRouterAdapter(api_key=os.environ.get("OPENROUTER_API_KEY", ""))
-        return OpenAIAdapter(api_key=os.environ.get("OPENAI_API_KEY", ""))
-    if config.provider == "local":
-        from ..mal.adapters.local import LocalAdapter
-        return LocalAdapter()
-    raise typer.BadParameter(f"Unknown provider: {config.provider!r}")
+def _make_provider(config: ProjectConfig) -> PluginModelProvider:
+    """Resolve provider by name via the plugin registry."""
+    try:
+        return PluginModelProvider.from_name(config.provider)
+    except KeyError:
+        known = [p.name for p in list_providers()]
+        raise typer.BadParameter(
+            f"Unknown provider: {config.provider!r}. "
+            f"Available: {', '.join(sorted(known))}"
+        )
 
 
 @app.command()
@@ -174,6 +172,59 @@ async def _list_threads(cwd: Path) -> None:
     thread_mgr = ThreadManager(db)
     for t in thread_mgr.list():
         console.print(f"  {t.id[:8]}  {t.name}")
+
+
+@app.command(name="providers")
+def list_providers_cmd() -> None:
+    """List all registered model providers."""
+    from rich.table import Table
+    from ..mal.provider_registry import list_providers as _list
+
+    table = Table(title="CrabKey Providers", show_lines=False)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Mode", style="dim")
+    table.add_column("Env var(s)", style="dim")
+    table.add_column("Description")
+
+    for p in sorted(_list(), key=lambda x: x.name):
+        env = ", ".join(p.env_vars[:2]) or "—"
+        table.add_row(p.name, p.api_mode, env, p.description or p.display_name)
+
+    console.print(table)
+
+
+@app.command(name="models")
+def list_models_cmd(
+    provider: str = typer.Argument(..., help="Provider name (e.g. anthropic, openrouter)"),
+) -> None:
+    """List agentic models available for a provider (from models.dev catalog)."""
+    from ..mal.model_catalog import list_agentic_models
+    from ..mal.provider_registry import get_provider_profile
+
+    profile = get_provider_profile(provider)
+    if profile is None:
+        console.print(f"[red]Unknown provider: {provider!r}. Run 'crabkey providers' to see available providers.[/red]")
+        raise typer.Exit(1)
+
+    # Try live fetch first, fall back to models.dev catalog, then fallback_models
+    api_key = next(
+        (os.environ.get(v) for v in profile.env_vars if os.environ.get(v)), None
+    )
+    live = profile.fetch_models(api_key=api_key, timeout=6.0)
+    if live:
+        models = live
+        source = "live"
+    else:
+        models = list_agentic_models(provider)
+        source = "models.dev"
+    if not models:
+        models = list(profile.fallback_models)
+        source = "fallback"
+
+    console.print(f"\n[bold]{profile.display_name or provider}[/bold] models ({source}):\n")
+    for m in models:
+        console.print(f"  {m}")
+    console.print()
 
 
 def main() -> None:
