@@ -347,6 +347,7 @@ class Repl:
             response = await self._provider.complete(messages, self._model_config)
         except Exception as exc:
             self._console.print(self._format_provider_error(exc))
+            self._console.file.flush()
             return
 
         reply = response.message.content or ""
@@ -355,6 +356,7 @@ class Repl:
         self._console.print()
         self._console.print(Markdown(reply))
         self._console.print()
+        self._console.file.flush()  # Ensure output is flushed before next input
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -374,15 +376,16 @@ class Repl:
         self._console.print()
 
         while self._running:
-            label = self._ctx.prompt_label()
             try:
                 # Display input box top
                 ui.boxed_input_top(self._console)
                 # Get user input
-                self._console.print("[bold cyan]You:[/bold cyan]", end=" ")
+                self._console.print("[bold cyan]You:[/bold cyan]", end=" ", highlight=False)
+                self._console.file.flush()  # Ensure prompt is displayed
                 user_input = await _async_input()
                 # Display input box bottom
                 ui.boxed_input_bottom(self._console)
+                self._console.file.flush()  # Ensure output is flushed
             except (EOFError, KeyboardInterrupt):
                 self._console.print("\n[dim]Bye.[/dim]")
                 break
