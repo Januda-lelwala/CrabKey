@@ -200,6 +200,18 @@ async def _run_async(
 
 
 @app.command()
+def tui(
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+) -> None:
+    """Launch the beautiful Ink (React) terminal UI."""
+    from .launcher import launch_tui
+
+    raise typer.Exit(launch_tui(cwd, provider, model))
+
+
+@app.command()
 def threads(
     cwd: Path = typer.Option(Path.cwd(), "--cwd"),
 ) -> None:
