@@ -296,9 +296,118 @@ def chat(
     provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
     allow_all: bool = typer.Option(False, "--allow-all", help="Grant ALLOW to all tools."),
     cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+    use_tui: bool = typer.Option(True, "--tui/--no-tui", help="Use Ink terminal UI (requires Node.js)."),
 ) -> None:
     """Start an interactive chat session with session and thread support."""
-    asyncio.run(_chat_async(session, model, provider, allow_all, cwd))
+    if use_tui:
+        asyncio.run(_chat_with_tui_async(session, model, provider, allow_all, cwd))
+    else:
+        asyncio.run(_chat_async(session, model, provider, allow_all, cwd))
+
+
+async def _chat_with_tui_async(
+    session_name: str | None,
+    model_override: str | None,
+    provider_override: str | None,
+    allow_all: bool,
+    cwd: Path,
+) -> None:
+    """Launch chat with Ink TUI frontend connected via WebSocket gateway."""
+    import subprocess
+    from .tui_gateway import TUIGateway
+
+    config_dir, project_config, db_path = _resolve_project(cwd)
+
+    if provider_override:
+        project_config.provider = provider_override
+    if model_override:
+        project_config.model = model_override
+
+    provider = _make_provider(project_config)
+    db = Db(db_path)
+    await db.initialize()
+
+    session_mgr = SessionManager(db)
+    thread_mgr = ThreadManager(db)
+
+    # Resume or create a session
+    if session_name:
+        try:
+            await session_mgr.switch(session_name)
+        except KeyError:
+            sess = await session_mgr.new(session_name)
+    else:
+        sess = await session_mgr.new()
+
+    model_config = ModelConfig(
+        model=project_config.model,
+        max_tokens=project_config.max_tokens,
+        system=(
+            "You are CrabKey, an agentic coding assistant. "
+            "Be concise, precise, and helpful."
+        ),
+    )
+
+    # Create TUI Gateway
+    gateway = TUIGateway("localhost", 8765)
+
+    # Register JSON-RPC handlers
+    async def handle_send_message(message: str) -> dict:
+        """Handle incoming chat message from TUI."""
+        # TODO: Connect to actual LLM provider
+        return {
+            "role": "assistant",
+            "content": f"Echo: {message}",
+        }
+
+    async def handle_get_session_details() -> dict:
+        """Return current session details."""
+        return {
+            "model": project_config.model,
+            "provider": project_config.provider,
+            "tools": ["file.read", "file.write", "file.edit", "shell.run", "web.fetch"],
+        }
+
+    gateway.register_handler("send_message", handle_send_message)
+    gateway.register_handler("get_session_details", handle_get_session_details)
+
+    # Start gateway in background
+    gateway_task = asyncio.create_task(gateway.run())
+
+    # Find crabkey-ui entry point
+    crabkey_ui_path = Path(__file__).parent.parent.parent / "crabkey-ui" / "src" / "entry.tsx"
+    if not crabkey_ui_path.exists():
+        console.print("[red]Error: CrabKey UI not found. Run 'npm install' in crabkey-ui/ folder.[/red]")
+        await gateway.stop()
+        return
+
+    # Wait a moment for gateway to start
+    await asyncio.sleep(0.5)
+
+    try:
+        # Spawn Ink UI as subprocess
+        console.print("[dim]Starting Ink TUI...[/dim]")
+        ui_process = await asyncio.create_subprocess_exec(
+            "npx",
+            "tsx",
+            str(crabkey_ui_path),
+            cwd=str(crabkey_ui_path.parent.parent),
+        )
+
+        # Wait for UI process to finish
+        await ui_process.wait()
+    except FileNotFoundError:
+        console.print("[red]Error: npx/tsx not found. Install Node.js and dependencies in crabkey-ui/[/red]")
+    except Exception as e:
+        console.print(f"[red]Error launching TUI: {e}[/red]")
+    finally:
+        # Clean up
+        await gateway.stop()
+        gateway_task.cancel()
+        try:
+            await gateway_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _chat_async(
