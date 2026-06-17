@@ -1,0 +1,35 @@
+{
+  "name": "crabkey-ui",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx --watch src/entry.tsx",
+    "start": "tsx src/entry.tsx",
+    "build": "esbuild src/entry.tsx --bundle --platform=node --outfile=dist/index.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "fmt": "prettier --write 'src/**/*.{ts,tsx}'",
+    "fix": "npm run lint:fix && npm run fmt"
+  },
+  "dependencies": {
+    "ink": "^6.8.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.4",
+    "nanostores": "^1.2.0",
+    "@nanostores/react": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "@types/react": "^19.2.14",
+    "@typescript-eslint/eslint-plugin": "^8",
+    "@typescript-eslint/parser": "^8",
+    "eslint": "^9",
+    "eslint-plugin-react": "^7",
+    "eslint-plugin-react-hooks": "^7",
+    "prettier": "^3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "esbuild": "^0.28.1"
+  }
+}
