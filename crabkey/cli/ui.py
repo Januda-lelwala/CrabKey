@@ -42,29 +42,20 @@ def section_header(console: Console, title: str, icon: str = "▸") -> None:
     console.print(f"[bold cyan]{icon}[/bold cyan] [bold]{title}[/bold]")
 
 
-def boxed_input_display(console: Console) -> None:
-    """Display the top of Claude Code-style boxed input."""
+def boxed_input_top(console: Console) -> None:
+    """Display the top line of input box."""
     console.print("[cyan]┌─────────────────────────────────────────────────────────────┐[/cyan]")
-    console.print(f"[cyan]│[/cyan] [bold cyan]You[/bold cyan]")
-    console.print("[cyan]├─────────────────────────────────────────────────────────────┤[/cyan]", end=" ")
 
 
-def boxed_input_close(console: Console) -> None:
-    """Close the Claude Code-style boxed input."""
+def boxed_input_bottom(console: Console) -> None:
+    """Display the bottom line of input box."""
     console.print("[cyan]└─────────────────────────────────────────────────────────────┘[/cyan]")
 
 
-def assistant_message_box(console: Console) -> None:
-    """Display a Claude Code-style box header for assistant messages."""
+def display_below_input(console: Console, content: str) -> None:
+    """Display content below the input box (for assistant messages, etc)."""
     console.print()
-    console.print("[cyan]┌─ Assistant ──────────────────────────────────────────────────┐[/cyan]")
-    console.print("[cyan]│[/cyan]")
-
-
-def close_message_box(console: Console) -> None:
-    """Close the assistant message box."""
-    console.print("[cyan]│[/cyan]")
-    console.print("[cyan]└───────────────────────────────────────────────────────────────┘[/cyan]")
+    console.print(content)
     console.print()
 
 

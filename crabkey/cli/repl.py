@@ -352,9 +352,9 @@ class Repl:
         reply = response.message.content or ""
         await self._ctx.append_assistant(reply)
 
-        ui.assistant_message_box(self._console)
+        self._console.print()
         self._console.print(Markdown(reply))
-        ui.close_message_box(self._console)
+        self._console.print()
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -376,10 +376,13 @@ class Repl:
         while self._running:
             label = self._ctx.prompt_label()
             try:
-                # Display boxed input
-                ui.boxed_input_display(self._console)
+                # Display input box top
+                ui.boxed_input_top(self._console)
+                # Get user input
+                self._console.print("[bold cyan]You:[/bold cyan]", end=" ")
                 user_input = await _async_input()
-                ui.boxed_input_close(self._console)
+                # Display input box bottom
+                ui.boxed_input_bottom(self._console)
             except (EOFError, KeyboardInterrupt):
                 self._console.print("\n[dim]Bye.[/dim]")
                 break
