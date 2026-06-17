@@ -23,9 +23,15 @@ from typing import Any
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.styles import Style as PTStyle
+    HAS_PROMPT_TOOLKIT = True
+except ImportError:
+    HAS_PROMPT_TOOLKIT = False
 
 from ..mal.message import Message, Role
 from ..mal.provider import ModelConfig
@@ -375,13 +381,26 @@ class Repl:
         self._console.print("[dim]Type a message to chat. Use [bold]/help[/bold] for slash commands. [bold]/quit[/bold] to exit.[/dim]")
         self._console.print()
 
+        # Setup prompt_toolkit session for better input handling
+        if HAS_PROMPT_TOOLKIT:
+            prompt_session = PromptSession()
+
         while self._running:
             try:
                 # Display input box top
                 ui.boxed_input_top(self._console)
-                # Get user input directly from stdin
-                print("\033[1;36mYou:\033[0m ", end="", flush=True)
-                user_input = sys.stdin.readline().rstrip('\n')
+
+                # Get input using prompt_toolkit (better terminal handling)
+                if HAS_PROMPT_TOOLKIT:
+                    user_input = await prompt_session.prompt_async(
+                        "\033[1;36mYou:\033[0m ",
+                        mouse_support=False,
+                    )
+                else:
+                    # Fallback to basic input
+                    print("\033[1;36mYou:\033[0m ", end="", flush=True)
+                    user_input = sys.stdin.readline().rstrip('\n')
+
                 # Display input box bottom
                 ui.boxed_input_bottom(self._console)
             except (EOFError, KeyboardInterrupt):
