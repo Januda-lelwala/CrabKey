@@ -49,7 +49,8 @@ def boxed_input_top(console: Console) -> None:
 
 def boxed_input_bottom(console: Console) -> None:
     """Display the bottom line of input box."""
-    console.print("[cyan]└─────────────────────────────────────────────────────────────┘[/cyan]")
+    # Use plain print to ensure it appears after stdin.readline()
+    print("\033[36m└─────────────────────────────────────────────────────────────┘\033[0m", flush=True)
 
 
 def display_below_input(console: Console, content: str) -> None:
