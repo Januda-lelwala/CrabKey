@@ -1,17 +1,15 @@
 import React, { useEffect, useState } from 'react'
 import { Box, Text } from 'ink'
-import { AppLayout } from './components/AppLayout.tsx'
+import { useStore } from '@nanostores/react'
+import { GatewayProvider } from './app/gatewayContext.tsx'
+import { $messages, addMessage, setLoading } from './app/uiStore.ts'
+import { GatewayClient } from './lib/gatewayClient.ts'
 import { SessionDetails } from './components/SessionDetails.tsx'
 import { ChatInput } from './components/ChatInput.tsx'
 import { ChatMessage } from './components/ChatMessage.tsx'
 
-interface Message {
-  role: 'user' | 'assistant'
-  content: string
-}
-
-export function App() {
-  const [messages, setMessages] = useState<Message[]>([])
+function AppContent() {
+  const messages = useStore($messages)
   const [sessionDetails, setSessionDetails] = useState({
     model: 'nex-agi/nex-n2-pro:free',
     provider: 'openrouter',
@@ -22,16 +20,19 @@ export function App() {
     if (!text.trim()) return
 
     // Add user message
-    const userMessage: Message = { role: 'user', content: text }
-    setMessages((prev) => [...prev, userMessage])
+    addMessage({
+      role: 'user',
+      content: text,
+    })
 
     // Simulate assistant response (will connect to Python backend)
+    setLoading(true)
     setTimeout(() => {
-      const assistantMessage: Message = {
+      addMessage({
         role: 'assistant',
         content: `You said: "${text}". This is a simulated response.`,
-      }
-      setMessages((prev) => [...prev, assistantMessage])
+      })
+      setLoading(false)
     }, 500)
   }
 
@@ -57,5 +58,25 @@ export function App() {
 
       <ChatInput onSubmit={handleSendMessage} />
     </Box>
+  )
+}
+
+export function App() {
+  const gateway = new GatewayClient('ws://localhost:8765')
+
+  useEffect(() => {
+    gateway.connect().catch((error) => {
+      console.error('Failed to connect to gateway:', error)
+    })
+
+    return () => {
+      gateway.disconnect()
+    }
+  }, [])
+
+  return (
+    <GatewayProvider gateway={gateway}>
+      <AppContent />
+    </GatewayProvider>
   )
 }
