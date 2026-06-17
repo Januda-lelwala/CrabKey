@@ -31,6 +31,7 @@ from ..mal.provider import ModelConfig
 from ..orchestration.session_manager import Session, SessionManager
 from ..orchestration.thread_manager import Thread, ThreadManager
 from ..persistence.db import Db
+from . import ui
 
 
 class ConversationContext:
@@ -120,7 +121,7 @@ class Repl:
 
     async def _cmd_session(self, args: list[str]) -> None:
         if not args:
-            self._console.print("[yellow]Usage: /session new|list|switch[/yellow]")
+            ui.warning_message(self._console, "Usage: /session new|list|switch")
             return
 
         sub = args[0]
@@ -128,11 +129,10 @@ class Repl:
         if sub == "new":
             name = " ".join(args[1:]) or None
             session = await self._session_mgr.new(name)
-            # Exit any active thread when switching sessions
             self._thread_mgr.exit_thread()
-            self._console.print(
-                f"[green]✓[/green] New session [bold cyan]{session.name}[/bold cyan] "
-                f"[dim]({session.id[:8]})[/dim]"
+            ui.success_message(
+                self._console,
+                f"New session [bold cyan]{session.name}[/bold cyan] [dim]({session.id[:8]})[/dim]"
             )
 
         elif sub == "list":
@@ -140,47 +140,48 @@ class Repl:
             if not records:
                 self._console.print("[dim]No sessions yet.[/dim]")
                 return
-            table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+            table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 2))
             table.add_column("ID", style="dim", no_wrap=True)
             table.add_column("Name", style="cyan")
             table.add_column("Updated", style="dim")
             active = self._session_mgr.active
             for r in records:
-                marker = " ←" if (active and r.id == active.id) else ""
+                marker = " [cyan]←[/cyan]" if (active and r.id == active.id) else ""
                 table.add_row(
                     r.id[:8],
                     r.name + marker,
                     r.updated_at.strftime("%Y-%m-%d %H:%M"),
                 )
-            self._console.print(table)
+            self._console.print(Panel(table, title="[bold]Sessions[/bold]", border_style="cyan", padding=(0, 1)))
 
         elif sub == "switch":
             if len(args) < 2:
-                self._console.print("[yellow]Usage: /session switch <name|id>[/yellow]")
+                ui.warning_message(self._console, "Usage: /session switch <name|id>")
                 return
             name_or_id = " ".join(args[1:])
             try:
                 session = await self._session_mgr.switch(name_or_id)
                 self._thread_mgr.exit_thread()
-                self._console.print(
-                    f"[green]✓[/green] Switched to session [bold cyan]{session.name}[/bold cyan]"
+                ui.success_message(
+                    self._console,
+                    f"Switched to session [bold cyan]{session.name}[/bold cyan]"
                 )
             except KeyError:
-                self._console.print(f"[red]Session {name_or_id!r} not found.[/red]")
+                ui.error_message(self._console, f"Session {name_or_id!r} not found")
 
         else:
-            self._console.print(f"[yellow]Unknown session subcommand: {sub!r}[/yellow]")
+            ui.warning_message(self._console, f"Unknown session subcommand: {sub!r}")
 
     async def _cmd_thread(self, args: list[str]) -> None:
         if not args:
-            self._console.print("[yellow]Usage: /thread new|list|exit[/yellow]")
+            ui.warning_message(self._console, "Usage: /thread new|list|exit")
             return
 
         sub = args[0]
         session = self._session_mgr.active
 
         if session is None:
-            self._console.print("[red]No active session. Create one with /session new[/red]")
+            ui.error_message(self._console, "No active session. Create one with /session new")
             return
 
         if sub == "new":
@@ -191,9 +192,9 @@ class Repl:
                 name=name,
                 forked_at=forked_at,
             )
-            self._console.print(
-                f"[green]✓[/green] Thread [bold yellow]{thread.name}[/bold yellow] created "
-                f"[dim](forked at {forked_at} messages)[/dim]"
+            ui.success_message(
+                self._console,
+                f"Thread [bold yellow]{thread.name}[/bold yellow] created [dim](forked at {forked_at} messages)[/dim]"
             )
 
         elif sub == "exit":
@@ -203,9 +204,9 @@ class Repl:
                 return
             name = thr.name
             self._thread_mgr.exit_thread()
-            self._console.print(
-                f"[green]✓[/green] Exited thread [bold yellow]{name}[/bold yellow] "
-                f"— back to session [bold cyan]{session.name}[/bold cyan]"
+            ui.success_message(
+                self._console,
+                f"Exited thread [bold yellow]{name}[/bold yellow] — back to session [bold cyan]{session.name}[/bold cyan]"
             )
 
         elif sub == "list":
@@ -213,24 +214,24 @@ class Repl:
             if not records:
                 self._console.print("[dim]No threads in this session.[/dim]")
                 return
-            table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+            table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 2))
             table.add_column("ID", style="dim", no_wrap=True)
             table.add_column("Name", style="yellow")
             table.add_column("Fork point", style="dim")
             table.add_column("Created", style="dim")
             active_thr = self._thread_mgr.active
             for r in records:
-                marker = " ←" if (active_thr and r.id == active_thr.id) else ""
+                marker = " [yellow]←[/yellow]" if (active_thr and r.id == active_thr.id) else ""
                 table.add_row(
                     r.id[:8],
                     r.name + marker,
                     str(r.forked_at),
                     r.created_at.strftime("%Y-%m-%d %H:%M"),
                 )
-            self._console.print(table)
+            self._console.print(Panel(table, title="[bold]Threads[/bold]", border_style="yellow", padding=(0, 1)))
 
         else:
-            self._console.print(f"[yellow]Unknown thread subcommand: {sub!r}[/yellow]")
+            ui.warning_message(self._console, f"Unknown thread subcommand: {sub!r}")
 
     async def _db_list_threads(self, session_id: str):
         return await self._session_mgr._db.list_threads_for_session(session_id)
@@ -238,25 +239,35 @@ class Repl:
     def _cmd_status(self) -> None:
         sess = self._session_mgr.active
         thr = self._thread_mgr.active
-        lines: list[str] = []
+        rows: list[dict] = []
+
         if sess:
             msg_count = len(sess.messages)
-            lines.append(f"Session : [cyan bold]{sess.name}[/cyan bold] [dim]({sess.id[:8]}) — {msg_count} messages[/dim]")
+            rows.append({
+                "label": "Session",
+                "value": f"[cyan bold]{sess.name}[/cyan bold] [dim]({sess.id[:8]}) — {msg_count} messages[/dim]"
+            })
         else:
-            lines.append("Session : [dim]none[/dim]")
+            rows.append({"label": "Session", "value": "[dim]none[/dim]"})
 
         if thr:
-            lines.append(
-                f"Thread  : [yellow bold]{thr.name}[/yellow bold] [dim]({thr.id[:8]}) "
-                f"— forked at {thr.forked_at}, {len(thr.history)} thread messages[/dim]"
-            )
+            rows.append({
+                "label": "Thread",
+                "value": f"[yellow bold]{thr.name}[/yellow bold] [dim]({thr.id[:8]}) — forked at {thr.forked_at}, {len(thr.history)} thread messages[/dim]"
+            })
         else:
-            lines.append("Thread  : [dim]none[/dim]")
+            rows.append({"label": "Thread", "value": "[dim]none[/dim]"})
 
-        self._console.print(Panel("\n".join(lines), title="Status", border_style="dim"))
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="dim")
+        table.add_column(style="bold")
+        for row in rows:
+            table.add_row(row["label"], row["value"])
+
+        self._console.print(Panel(table, title="[bold]Status[/bold]", border_style="dim", padding=(1, 2)))
 
     def _cmd_help(self) -> None:
-        self._console.print(Panel(__doc__ or "", title="CrabKey slash commands", border_style="dim"))
+        self._console.print(Panel(__doc__ or "", title="[bold]CrabKey Commands[/bold]", border_style="dim", padding=(1, 2)))
 
     # ── Error formatting ──────────────────────────────────────────────────────
 
@@ -322,7 +333,7 @@ class Repl:
         elif cmd in ("quit", "q", "exit"):
             return False
         else:
-            self._console.print(f"[yellow]Unknown command: /{cmd}  — try /help[/yellow]")
+            ui.warning_message(self._console, f"Unknown command: /{cmd}  — try /help")
 
         return True
 
@@ -349,18 +360,19 @@ class Repl:
 
     async def run(self) -> None:
         self._running = True
+        ui.header_banner(self._console, "CrabKey Chat", "Interactive conversation with session support")
         self._console.print(
             Panel(
-                "[dim]Type a message to chat. Use [bold]/help[/bold] for slash commands.[/dim]",
+                "[dim]Type a message to chat. Use [bold]/help[/bold] for slash commands. [bold]/quit[/bold] to exit.[/dim]",
                 border_style="cyan",
-                title="CrabKey",
+                padding=(1, 2),
             )
         )
+        self._console.print()
 
         while self._running:
             label = self._ctx.prompt_label()
             try:
-                # Rich doesn't have async prompt; use input() with a formatted prefix
                 self._console.print(f"{label} ", end="")
                 user_input = await _async_input()
             except (EOFError, KeyboardInterrupt):
@@ -378,8 +390,9 @@ class Repl:
                     break
             else:
                 if self._session_mgr.active is None:
-                    self._console.print(
-                        "[yellow]No active session. Create one first: /session new[/yellow]"
+                    ui.error_message(
+                        self._console,
+                        "No active session. Create one first: /session new"
                     )
                     continue
                 await self._llm_turn(user_input)

@@ -24,6 +24,7 @@ from rich.text import Text
 
 from ..mal.provider_registry import list_providers
 from ..persistence.config import ProjectConfig
+from . import ui
 
 
 console = Console()
@@ -302,11 +303,7 @@ def run_configure(cwd: Path, global_config: bool = False) -> None:
         config_path = cwd / ".crabkey" / "config.toml"
         scope_label = f"project ({config_path})"
 
-    console.print(Panel(
-        f"[bold]CrabKey configuration wizard[/bold]\n"
-        f"[dim]Writing to {scope_label}[/dim]",
-        border_style="cyan",
-    ))
+    ui.header_banner(console, "CrabKey Configuration", f"Writing to {scope_label}")
 
     # Load existing config as starting point
     existing = ProjectConfig.load(config_path)
@@ -317,14 +314,14 @@ def run_configure(cwd: Path, global_config: bool = False) -> None:
     max_tokens = _select_max_tokens(existing.max_tokens)
 
     # Summary
-    console.print("\n")
+    console.print()
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="dim")
-    table.add_column(style="bold")
+    table.add_column(style="bold cyan")
     table.add_row("provider", provider)
     table.add_row("model", model)
     table.add_row("max_tokens", str(max_tokens))
-    console.print(Panel(table, title="Summary", border_style="green"))
+    console.print(Panel(table, title="[bold]Summary[/bold]", border_style="green", padding=(1, 2)))
 
     confirm = _prompt("\n  Write config? (Y/n)", default="y").lower()
     if confirm in ("n", "no"):
@@ -333,5 +330,5 @@ def run_configure(cwd: Path, global_config: bool = False) -> None:
 
     new_config = ProjectConfig(provider=provider, model=model, max_tokens=max_tokens)
     new_config.save(config_path)
-    console.print(f"\n[green]✓[/green]  Config saved to [bold]{config_path}[/bold]")
+    ui.success_message(console, f"Config saved to [bold]{config_path}[/bold]")
     console.print(f"\n  [dim]Run [bold]crabkey chat[/bold] to start a session.[/dim]\n")
