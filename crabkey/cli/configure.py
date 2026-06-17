@@ -111,16 +111,26 @@ def _select_provider(current: str) -> str:
 # ── Step 2: API key ───────────────────────────────────────────────────────────
 
 
+_CRABKEY_ENV_FILE = Path.home() / ".config" / "crabkey" / "env"
+
+
 def _configure_api_key(provider_name: str) -> None:
     from ..mal.provider_registry import get_provider_profile
 
     profile = get_provider_profile(provider_name)
-    if profile is None or not profile.env_vars:
+    if profile is None:
         return
+
+    # Find the primary API key variable (ignore URL-style vars)
+    primary_var = next(
+        (v for v in profile.env_vars if "API_KEY" in v.upper() or "TOKEN" in v.upper()),
+        None,
+    )
+    if not primary_var:
+        return  # provider doesn't need an API key (e.g. local)
 
     console.print(f"\n[bold]Step 2 — API key for [cyan]{provider_name}[/cyan][/bold]\n")
 
-    primary_var = profile.env_vars[0]
     current_val = os.environ.get(primary_var, "")
 
     if current_val:
@@ -129,50 +139,61 @@ def _configure_api_key(provider_name: str) -> None:
         if change != "y":
             return
 
-    console.print(f"  Enter your API key (it will be shown as you type):")
+    console.print(f"  Enter your API key:")
     new_key = _prompt(f"  {primary_var}", secret=False)
 
     if not new_key:
         console.print("  [dim]Skipped — key unchanged.[/dim]")
         return
 
-    # Write to shell rc so it persists
+    # 1. Save to ~/.config/crabkey/env so all crabkey commands load it immediately
+    _write_to_crabkey_env(primary_var, new_key)
+    # 2. Also write to shell rc for non-crabkey tools / new shells
     _write_env_var_to_shell(primary_var, new_key)
+    # 3. Set in the current process so the rest of this wizard sees it
     os.environ[primary_var] = new_key
-    console.print(f"  [green]✓[/green]  {primary_var} set (exported to shell profile and current session).")
+    console.print(f"  [green]✓[/green]  {primary_var} saved.")
+
+
+def _write_to_crabkey_env(var: str, value: str) -> None:
+    """Upsert VAR=value in ~/.config/crabkey/env (loaded automatically by all crabkey commands)."""
+    _CRABKEY_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    existing = _CRABKEY_ENV_FILE.read_text(encoding="utf-8") if _CRABKEY_ENV_FILE.exists() else ""
+    new_lines = []
+    replaced = False
+    for line in existing.splitlines():
+        if line.startswith(f"{var}=") or line.startswith(f"{var} ="):
+            new_lines.append(f'{var}="{value}"')
+            replaced = True
+        else:
+            new_lines.append(line)
+    if not replaced:
+        new_lines.append(f'{var}="{value}"')
+    _CRABKEY_ENV_FILE.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    console.print(f"  [dim]Saved to {_CRABKEY_ENV_FILE}[/dim]")
 
 
 def _write_env_var_to_shell(var: str, value: str) -> None:
-    """Append export VAR=value to the user's shell profile file."""
+    """Also export to shell rc so other tools (non-crabkey) see the key in new shells."""
     shell = os.environ.get("SHELL", "")
-    if "zsh" in shell:
-        rc = Path.home() / ".zshenv"
-    elif "fish" in shell:
-        # fish uses a different syntax — skip silent write, just inform
-        console.print(f"\n  [yellow]Fish shell detected. Add manually:[/yellow]")
-        console.print(f"  [dim]set -Ux {var} {value!r}[/dim]")
+    if "fish" in shell:
+        console.print(f"  [dim]Fish shell: run [bold]set -Ux {var} '…'[/bold] to persist for other tools.[/dim]")
         return
-    else:
-        rc = Path.home() / ".bashrc"
 
-    export_line = f'\nexport {var}="{value}"\n'
-
-    # Avoid duplicating an existing export
+    rc = Path.home() / ".zshenv" if "zsh" in shell else Path.home() / ".bashrc"
     existing = rc.read_text(encoding="utf-8") if rc.exists() else ""
+
     if f"export {var}=" in existing:
-        # Replace the existing line
-        new_lines = []
-        for line in existing.splitlines():
-            if line.startswith(f"export {var}="):
-                new_lines.append(f'export {var}="{value}"')
-            else:
-                new_lines.append(line)
+        new_lines = [
+            f'export {var}="{value}"' if line.startswith(f"export {var}=") else line
+            for line in existing.splitlines()
+        ]
         rc.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     else:
         with rc.open("a", encoding="utf-8") as f:
-            f.write(export_line)
+            f.write(f'\nexport {var}="{value}"\n')
 
-    console.print(f"  [dim]Written to {rc}[/dim]")
+    console.print(f"  [dim]Also written to {rc} for new shell sessions.[/dim]")
 
 
 # ── Step 3: model selection ───────────────────────────────────────────────────

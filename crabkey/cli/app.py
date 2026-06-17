@@ -39,6 +39,30 @@ app = typer.Typer(
 )
 console = Console()
 
+_CRABKEY_ENV_FILE = Path.home() / ".config" / "crabkey" / "env"
+
+
+def _load_crabkey_env() -> None:
+    """Load API keys from ~/.config/crabkey/env into the current process's environment.
+
+    Keys already present in the environment are NOT overwritten, so shell-level
+    exports always take precedence.  This lets crabkey work immediately after
+    'crabkey configure' without requiring the user to source their shell rc.
+    """
+    if not _CRABKEY_ENV_FILE.exists():
+        return
+    for line in _CRABKEY_ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"\'')
+        os.environ.setdefault(key, val)  # don't override if already set
+
+
+_load_crabkey_env()
+
 
 def _resolve_project(cwd: Path) -> tuple[Path, ProjectConfig, Path]:
     config_dir = cwd / ".crabkey"
