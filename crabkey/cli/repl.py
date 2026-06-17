@@ -28,7 +28,7 @@ from rich.text import Text
 
 try:
     from prompt_toolkit import PromptSession
-    from prompt_toolkit.styles import Style as PTStyle
+    from prompt_toolkit.formatted_text import HTML
     HAS_PROMPT_TOOLKIT = True
 except ImportError:
     HAS_PROMPT_TOOLKIT = False
@@ -393,7 +393,7 @@ class Repl:
                 # Get input using prompt_toolkit (better terminal handling)
                 if HAS_PROMPT_TOOLKIT:
                     user_input = await prompt_session.prompt_async(
-                        "\033[1;36mYou:\033[0m ",
+                        "You: ",
                         mouse_support=False,
                     )
                 else:
