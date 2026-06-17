@@ -258,6 +258,47 @@ class Repl:
     def _cmd_help(self) -> None:
         self._console.print(Panel(__doc__ or "", title="CrabKey slash commands", border_style="dim"))
 
+    # ── Error formatting ──────────────────────────────────────────────────────
+
+    def _format_provider_error(self, exc: Exception) -> str:
+        msg = str(exc)
+        profile = self._provider.profile
+        missing = self._provider.missing_key()
+
+        # Auth / key errors
+        is_auth = (
+            "401" in msg
+            or "403" in msg
+            or "authentication" in msg.lower()
+            or "api key" in msg.lower()
+            or "missing authentication" in msg.lower()
+            or "invalid x-api-key" in msg.lower()
+            or isinstance(exc, RuntimeError) and "API key" in msg
+        )
+        if is_auth:
+            var = missing or next(
+                (v for v in profile.env_vars if "API_KEY" in v.upper() or "TOKEN" in v.upper()), None
+            )
+            hint = (
+                f"\n  Set [bold]{var}[/bold] or run [bold]crabkey configure[/bold]."
+                if var else "\n  Run [bold]crabkey configure[/bold] to set up authentication."
+            )
+            return f"[red]Authentication failed[/red] for provider [cyan]{profile.name}[/cyan].{hint}"
+
+        # Model not found
+        if "404" in msg or "model" in msg.lower() and "not found" in msg.lower():
+            return (
+                f"[red]Model not found:[/red] [bold]{self._model_config.model}[/bold]\n"
+                f"  Run [bold]crabkey models {profile.name}[/bold] to see available models."
+            )
+
+        # Rate limit
+        if "429" in msg or "rate limit" in msg.lower():
+            return f"[yellow]Rate limited[/yellow] by [cyan]{profile.name}[/cyan]. Wait a moment and retry."
+
+        # Generic fallback
+        return f"[red]Provider error ({profile.name}):[/red] {msg}"
+
     # ── Command dispatch ──────────────────────────────────────────────────────
 
     async def _handle_slash(self, line: str) -> bool:
@@ -294,7 +335,7 @@ class Repl:
         try:
             response = await self._provider.complete(messages, self._model_config)
         except Exception as exc:
-            self._console.print(f"[red]Provider error: {exc}[/red]")
+            self._console.print(self._format_provider_error(exc))
             return
 
         reply = response.message.content or ""

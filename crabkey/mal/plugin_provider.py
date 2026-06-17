@@ -35,6 +35,15 @@ def _resolve_api_key(profile: ProviderProfile, override: str | None = None) -> s
     return None
 
 
+def _key_env_var(profile: ProviderProfile) -> str | None:
+    """Return the first env var that looks like an API key (not a URL), or None."""
+    for var in profile.env_vars:
+        upper = var.upper()
+        if "API_KEY" in upper or upper.endswith("_TOKEN") or upper.endswith("_SECRET"):
+            return var
+    return None
+
+
 def _normalized_to_completion(resp: NormalizedResponse, model: str) -> CompletionResponse:
     """Convert NormalizedResponse (transport layer) → CompletionResponse (public API)."""
     tool_calls = []
@@ -123,6 +132,13 @@ class PluginModelProvider(ModelProvider):
         self._transport = get_transport(profile.api_mode)
         self._client: Any = None
 
+    def missing_key(self) -> str | None:
+        """Return the env var name if a required API key is missing, else None."""
+        var = _key_env_var(self._profile)
+        if var is None:
+            return None  # provider doesn't need a key (e.g. local)
+        return var if not os.environ.get(var) and not self._api_key else None
+
     def _get_client(self) -> Any:
         if self._client is not None:
             return self._client
@@ -132,14 +148,26 @@ class PluginModelProvider(ModelProvider):
                 import anthropic
             except ImportError as exc:
                 raise ImportError("Install 'anthropic' to use the Anthropic provider.") from exc
-            self._client = anthropic.AsyncAnthropic(api_key=self._api_key)
+            self._client = anthropic.AsyncAnthropic(api_key=self._api_key or None)
         else:
             try:
                 import openai
             except ImportError as exc:
                 raise ImportError("Install 'openai' to use OpenAI-compatible providers.") from exc
+
+            # For providers that require a key, raise early with a clear message
+            # rather than passing a literal "no-key" and getting a cryptic 401.
+            key = self._api_key
+            if key is None:
+                var = _key_env_var(self._profile)
+                if var:
+                    raise RuntimeError(
+                        f"No API key found for provider '{self._profile.name}'. "
+                        f"Set the {var} environment variable, or run 'crabkey configure'."
+                    )
+
             self._client = openai.AsyncOpenAI(
-                api_key=self._api_key or "no-key",
+                api_key=key or "no-key",   # "no-key" only reached for keyless local servers
                 base_url=self._profile.get_base_url() or None,
             )
         return self._client

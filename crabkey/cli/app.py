@@ -267,6 +267,17 @@ async def _chat_async(
         project_config.model = model_override
 
     provider = _make_provider(project_config)
+
+    # Pre-flight: warn immediately if the API key is missing rather than
+    # letting the first message fail with a cryptic 401.
+    missing = provider.missing_key()
+    if missing:
+        console.print(
+            f"\n[yellow]Warning:[/yellow] [bold]{missing}[/bold] is not set.\n"
+            f"  Run [bold]crabkey configure[/bold] to set it, or:\n"
+            f"  [dim]export {missing}=your-key-here[/dim]\n"
+        )
+
     db = Db(db_path)
     await db.initialize()
 

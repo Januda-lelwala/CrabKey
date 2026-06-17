@@ -1,0 +1,3 @@
+provider = "openrouter"
+model    = "nvidia/nemotron-3.5-content-safety:free"
+max_tokens = 8192
