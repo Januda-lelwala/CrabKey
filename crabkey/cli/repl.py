@@ -352,29 +352,34 @@ class Repl:
         reply = response.message.content or ""
         await self._ctx.append_assistant(reply)
 
-        self._console.print()
+        ui.assistant_message_box(self._console)
         self._console.print(Markdown(reply))
-        self._console.print()
+        ui.close_message_box(self._console)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         self._running = True
-        ui.header_banner(self._console, "CrabKey Chat", "Interactive conversation with session support")
-        self._console.print(
-            Panel(
-                "[dim]Type a message to chat. Use [bold]/help[/bold] for slash commands. [bold]/quit[/bold] to exit.[/dim]",
-                border_style="cyan",
-                padding=(1, 2),
-            )
-        )
+
+        # Display big banner
+        ui.header_banner(self._console, "🦀 CrabKey", "AI-Powered Coding Assistant")
+
+        # Display session details
+        model = self._model_config.model
+        provider_name = self._provider.profile.name if hasattr(self._provider, 'profile') else "Unknown"
+        tools_list = ["file.read", "file.write", "file.edit", "shell.run", "web.fetch"]
+        ui.details_panel(self._console, model, provider_name, tools_list)
+
+        self._console.print("[dim]Type a message to chat. Use [bold]/help[/bold] for slash commands. [bold]/quit[/bold] to exit.[/dim]")
         self._console.print()
 
         while self._running:
             label = self._ctx.prompt_label()
             try:
-                self._console.print(f"{label} ", end="")
+                # Display boxed input
+                ui.boxed_input_display(self._console)
                 user_input = await _async_input()
+                ui.boxed_input_close(self._console)
             except (EOFError, KeyboardInterrupt):
                 self._console.print("\n[dim]Bye.[/dim]")
                 break

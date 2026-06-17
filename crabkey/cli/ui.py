@@ -1,6 +1,6 @@
 """Rich UI components and styling for CrabKey TUI.
 
-Provides consistent, polished styling similar to Claude Code's interface.
+Provides consistent, polished styling matching Claude Code's interface.
 """
 
 from rich.console import Console
@@ -9,21 +9,63 @@ from rich.text import Text
 from rich.align import Align
 from rich.table import Table
 from rich.style import Style
+from rich.box import Box
 
 
 def header_banner(console: Console, title: str = "CrabKey", subtitle: str = "") -> None:
-    """Display a polished header banner."""
-    border = "━" * 60
-    console.print(f"\n[bold cyan]{border}[/bold cyan]")
-    console.print(f"[bold cyan]  {title}[/bold cyan]")
+    """Display a massive header banner like Claude Code."""
+    console.print()
+    # Big bold text for CrabKey
+    console.print(f"[bold cyan]{title}[/bold cyan]", style="bold", highlight=False)
     if subtitle:
         console.print(f"[dim]{subtitle}[/dim]")
-    console.print(f"[bold cyan]{border}[/bold cyan]\n")
+    console.print()
+
+
+def details_panel(console: Console, model: str, provider: str, tools: list[str]) -> None:
+    """Display session details panel with model, provider, and tools."""
+    console.print()
+    table = Table(show_header=False, box=None, padding=(0, 2), show_edge=False)
+    table.add_column(style="dim", width=20)
+    table.add_column(style="cyan")
+
+    table.add_row("[bold]Model[/bold]", model)
+    table.add_row("[bold]Provider[/bold]", provider)
+    table.add_row("[bold]Tools[/bold]", ", ".join(tools) if tools else "[dim]none[/dim]")
+
+    console.print(Panel(table, border_style="cyan", padding=(1, 2), title="[bold cyan]Session Details[/bold cyan]"))
+    console.print()
 
 
 def section_header(console: Console, title: str, icon: str = "▸") -> None:
     """Display a section header with consistent styling."""
     console.print(f"[bold cyan]{icon}[/bold cyan] [bold]{title}[/bold]")
+
+
+def boxed_input_display(console: Console) -> None:
+    """Display the top of Claude Code-style boxed input."""
+    console.print("[cyan]┌─────────────────────────────────────────────────────────────┐[/cyan]")
+    console.print(f"[cyan]│[/cyan] [bold cyan]You[/bold cyan]")
+    console.print("[cyan]├─────────────────────────────────────────────────────────────┤[/cyan]", end=" ")
+
+
+def boxed_input_close(console: Console) -> None:
+    """Close the Claude Code-style boxed input."""
+    console.print("[cyan]└─────────────────────────────────────────────────────────────┘[/cyan]")
+
+
+def assistant_message_box(console: Console) -> None:
+    """Display a Claude Code-style box header for assistant messages."""
+    console.print()
+    console.print("[cyan]┌─ Assistant ──────────────────────────────────────────────────┐[/cyan]")
+    console.print("[cyan]│[/cyan]")
+
+
+def close_message_box(console: Console) -> None:
+    """Close the assistant message box."""
+    console.print("[cyan]│[/cyan]")
+    console.print("[cyan]└───────────────────────────────────────────────────────────────┘[/cyan]")
+    console.print()
 
 
 def info_panel(console: Console, content: str, title: str = "", border_style: str = "cyan") -> None:

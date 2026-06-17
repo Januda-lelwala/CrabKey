@@ -156,7 +156,13 @@ async def _run_async(
         goal = Prompt.ask("[bold cyan]Goal[/bold cyan]")
 
     thread = await thread_mgr.new(name=goal[:60])
-    console.print()
+
+    # Display big banner and details
+    ui.header_banner(console, "🦀 CrabKey", "Agentic Coding Assistant")
+    provider_name = provider.profile.name if hasattr(provider, 'profile') else "Unknown"
+    tools_list = ["file.read", "file.list", "file.write", "file.edit", "shell.run", "web.fetch"]
+    ui.details_panel(console, model_config.model, provider_name, tools_list)
+
     console.print(Panel(
         f"[bold]{goal}[/bold]",
         title="[bold cyan]Goal[/bold cyan]",
