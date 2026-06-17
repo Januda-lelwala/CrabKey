@@ -198,6 +198,18 @@ def _write_env_var_to_shell(var: str, value: str) -> None:
 
 # ── Step 3: model selection ───────────────────────────────────────────────────
 
+# Keywords that identify non-chat models (classifiers, embeddings, etc.)
+_NON_CHAT_KEYWORDS = (
+    "safety", "moderation", "content-safety", "embedding", "embed",
+    "rerank", "reranker", "classifier", "vision-only", "tts", "whisper",
+    "image-", "dall-e", "stable-diffusion",
+)
+
+
+def _is_chat_model(model_id: str) -> bool:
+    lower = model_id.lower()
+    return not any(kw in lower for kw in _NON_CHAT_KEYWORDS)
+
 
 def _select_model(provider_name: str, current_model: str) -> str:
     from ..mal.provider_registry import get_provider_profile
@@ -206,7 +218,7 @@ def _select_model(provider_name: str, current_model: str) -> str:
     console.print(f"\n[bold]Step 3 — Select a model[/bold]\n")
 
     profile = get_provider_profile(provider_name)
-    models: list[str] = []
+    all_models: list[str] = []
     source = "unknown"
 
     if profile:
@@ -214,30 +226,44 @@ def _select_model(provider_name: str, current_model: str) -> str:
         with console.status("[dim]Fetching model list…[/dim]", spinner="dots"):
             live = profile.fetch_models(api_key=api_key, timeout=6.0)
         if live:
-            models = live
+            all_models = live
             source = "live"
 
-    if not models:
-        models = list_agentic_models(provider_name)
+    if not all_models:
+        all_models = list_agentic_models(provider_name)
         source = "models.dev"
 
-    if not models and profile:
-        models = list(profile.fallback_models)
+    if not all_models and profile:
+        all_models = list(profile.fallback_models)
         source = "fallback"
 
-    if not models:
+    if not all_models:
         console.print("  [dim]No models found. Enter a model name manually:[/dim]")
         return _prompt("  Model", default=current_model)
 
-    console.print(f"  [dim]Source: {source} — {len(models)} models[/dim]\n")
+    # Filter down to chat-capable models only
+    chat_models = [m for m in all_models if _is_chat_model(m)]
+    filtered_count = len(all_models) - len(chat_models)
+    models = chat_models if chat_models else all_models  # fall back to full list if everything got filtered
 
-    # Show up to 20 models; if more, let user also type a name
+    note = f" ({filtered_count} non-chat models hidden)" if filtered_count else ""
+    console.print(f"  [dim]Source: {source} — {len(models)} models{note}[/dim]\n")
+
+    # Show up to 20 models; if more, let user type a name
     display = models[:20]
     items = [(m, "") for m in display]
     if len(models) > 20:
         items.append(("(type a model name not listed above)", ""))
 
-    default_idx = next((i for i, m in enumerate(display, 1) if m == current_model), 1)
+    # Default: current model if it's in the list, else first fallback model that appears, else 1
+    default_idx = next((i for i, m in enumerate(display, 1) if m == current_model), None)
+    if default_idx is None and profile:
+        default_idx = next(
+            (i for i, m in enumerate(display, 1) if any(fb in m for fb in profile.fallback_models)),
+            1,
+        )
+    default_idx = default_idx or 1
+
     idx = _choose(items, "model", default=default_idx)
 
     if idx > len(display):
