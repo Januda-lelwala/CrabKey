@@ -23,6 +23,7 @@ from typing import Any
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -347,16 +348,15 @@ class Repl:
             response = await self._provider.complete(messages, self._model_config)
         except Exception as exc:
             self._console.print(self._format_provider_error(exc))
-            self._console.file.flush()
             return
 
         reply = response.message.content or ""
         await self._ctx.append_assistant(reply)
 
+        # Print response below the input box
         self._console.print()
         self._console.print(Markdown(reply))
         self._console.print()
-        self._console.file.flush()  # Ensure output is flushed before next input
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -379,13 +379,11 @@ class Repl:
             try:
                 # Display input box top
                 ui.boxed_input_top(self._console)
-                # Get user input
-                self._console.print("[bold cyan]You:[/bold cyan]", end=" ", highlight=False)
-                self._console.file.flush()  # Ensure prompt is displayed
-                user_input = await _async_input()
+                # Get user input directly from stdin
+                print("\033[1;36mYou:\033[0m ", end="", flush=True)
+                user_input = sys.stdin.readline().rstrip('\n')
                 # Display input box bottom
                 ui.boxed_input_bottom(self._console)
-                self._console.file.flush()  # Ensure output is flushed
             except (EOFError, KeyboardInterrupt):
                 self._console.print("\n[dim]Bye.[/dim]")
                 break
