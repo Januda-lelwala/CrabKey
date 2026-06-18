@@ -26,6 +26,18 @@ def _find_tui_dir() -> Path | None:
     return None
 
 
+def _find_node_bin(tui_dir: Path) -> Path | None:
+    """Find a Node bin dir: a copy vendored beside the install, else system Node."""
+    # install.sh may vendor Node at <install_root>/node/bin (next to tui/).
+    vendored = tui_dir.parent / "node" / "bin"
+    if (vendored / "node").exists():
+        return vendored
+    node = shutil.which("node")
+    if node:
+        return Path(node).resolve().parent
+    return None
+
+
 def launch_tui(cwd: Path, provider: str | None, model: str | None) -> int:
     tui_dir = _find_tui_dir()
     if tui_dir is None:
@@ -36,25 +48,21 @@ def launch_tui(cwd: Path, provider: str | None, model: str | None) -> int:
         )
         return 1
 
-    node = shutil.which("node")
-    npm = shutil.which("npm")
-    if not node or not npm:
+    node_bin = _find_node_bin(tui_dir)
+    if node_bin is None:
         print(
             "error: Node.js is required for the CrabKey TUI.\n"
-            "  Install Node.js >= 18 from https://nodejs.org and try again.",
+            "  Re-run the installer (it can fetch a private copy), or install\n"
+            "  Node.js >= 18 from https://nodejs.org and try again.",
             file=sys.stderr,
         )
         return 1
 
-    # First run: install JS dependencies.
-    if not (tui_dir / "node_modules").exists():
-        print("Installing TUI dependencies (first run, this happens once)…", file=sys.stderr)
-        result = subprocess.run([npm, "install"], cwd=tui_dir)
-        if result.returncode != 0:
-            print("error: `npm install` failed for the TUI.", file=sys.stderr)
-            return result.returncode
+    npm = node_bin / "npm"
 
     env = os.environ.copy()
+    # Put our Node first so npm and tsx's `#!/usr/bin/env node` shebang resolve.
+    env["PATH"] = f"{node_bin}{os.pathsep}{env.get('PATH', '')}"
     env["CRABKEY_PYTHON"] = sys.executable
     # cwd for the spawned engine: the parent of tui/ holds the crabkey package
     # in source layouts; harmless when crabkey is importable globally (editable).
@@ -64,6 +72,14 @@ def launch_tui(cwd: Path, provider: str | None, model: str | None) -> int:
         env["CRABKEY_PROVIDER"] = provider
     if model:
         env["CRABKEY_MODEL"] = model
+
+    # First run (e.g. a dev checkout): install JS dependencies if missing.
+    if not (tui_dir / "node_modules").exists():
+        print("Installing TUI dependencies (first run, this happens once)…", file=sys.stderr)
+        result = subprocess.run([str(npm), "install"], cwd=tui_dir, env=env)
+        if result.returncode != 0:
+            print("error: `npm install` failed for the TUI.", file=sys.stderr)
+            return result.returncode
 
     tsx = tui_dir / "node_modules" / ".bin" / "tsx"
     cmd = [str(tsx), "source/cli.tsx"] if tsx.exists() else [npm, "start", "--silent"]

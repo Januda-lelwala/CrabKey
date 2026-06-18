@@ -19,13 +19,16 @@ curl -fsSL https://raw.githubusercontent.com/Janudax/CrabKey/main/install.sh | b
 ./install.sh
 ```
 
-**Prerequisites** (the installer checks for these):
+**Prerequisites:**
 
-- **Python ≥ 3.11**
-- **Node.js ≥ 18** — required because the TUI is built with Ink/React
+- **Python ≥ 3.11** (the engine's language — must be present)
+- **Node.js ≥ 18** — used by the Ink/React TUI. **You don't need to install it
+  yourself:** if no suitable Node is found, the installer downloads a private
+  copy into `~/.local/share/crabkey/node` and uses it only for CrabKey. Your
+  system is untouched. (Override the version with `CRABKEY_NODE_VERSION`.)
 
-The installer creates a private virtualenv, installs the engine, runs
-`npm install` for the TUI, and links the `crabkey` command.
+The installer creates a private virtualenv, installs the engine, provisions
+Node, runs `npm install` for the TUI, and links the `crabkey` command.
 
 ## Usage
 
@@ -52,5 +55,5 @@ and its JSON bridge to the Python engine.
 
 | Method | Ships the TUI? | Notes |
 |---|---|---|
-| `install.sh` (recommended) | ✅ | Owns Python + Node setup in one dir. Needs Node on the machine. |
-| PyPI (`pip install`) | ⚠️ needs packaging work | Would require bundling `tui/` into the wheel and Node on the machine. |
+| `install.sh` (recommended) | ✅ | Self-contained. Auto-downloads Node if missing — user only needs Python. |
+| PyPI (`pip install`) | ⚠️ needs packaging work | Would require bundling `tui/` into the wheel; Node would not be auto-provisioned. |

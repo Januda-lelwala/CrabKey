@@ -23,6 +23,7 @@ CRABKEY_HOME="${CRABKEY_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/crabkey}"
 BIN_DIR="${CRABKEY_BIN_DIR:-$HOME/.local/bin}"
 MIN_PY_MINOR=11      # require Python 3.11+
 MIN_NODE_MAJOR=18    # require Node 18+
+NODE_VERSION="${CRABKEY_NODE_VERSION:-v22.11.0}"   # vendored if no system Node
 
 # ── Pretty output ────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -36,6 +37,52 @@ info()  { printf '%s▸%s %s\n' "$C_ORANGE" "$C_RESET" "$1"; }
 ok()    { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$1"; }
 warn()  { printf '%s⚠%s %s\n' "$C_YELLOW" "$C_RESET" "$1" >&2; }
 die()   { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$1" >&2; exit 1; }
+
+# Stream a URL to stdout using whatever's available.
+fetch() {
+	if command -v curl >/dev/null 2>&1; then curl -fsSL "$1"
+	elif command -v wget >/dev/null 2>&1; then wget -qO- "$1"
+	else die "Need 'curl' or 'wget' to download files."; fi
+}
+
+# Ensure a usable Node ≥ MIN_NODE_MAJOR; vendor a private copy if missing.
+# Sets the globals NODE_BIN (dir containing node/npm) and NPM (path to npm).
+ensure_node() {
+	if command -v node >/dev/null 2>&1 \
+		&& [ "$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -ge "$MIN_NODE_MAJOR" ] \
+		&& command -v npm >/dev/null 2>&1; then
+		NODE_BIN="$(dirname "$(command -v node)")"
+		ok "Node: $(node --version) (system)"
+		NPM="$(command -v npm)"
+		return
+	fi
+
+	# No suitable system Node — download the official prebuilt into the app dir.
+	local os arch plat dest
+	case "$(uname -s)" in
+		Darwin) os=darwin ;;
+		Linux)  os=linux  ;;
+		*) die "Auto Node install isn't supported on $(uname -s). Install Node $MIN_NODE_MAJOR+ from https://nodejs.org and re-run." ;;
+	esac
+	case "$(uname -m)" in
+		arm64|aarch64) arch=arm64 ;;
+		x86_64|amd64)  arch=x64   ;;
+		*) die "Auto Node install isn't supported on $(uname -m). Install Node $MIN_NODE_MAJOR+ from https://nodejs.org and re-run." ;;
+	esac
+	plat="node-${NODE_VERSION}-${os}-${arch}"
+	dest="$CRABKEY_HOME/node"
+
+	info "No system Node.js found — downloading a private copy ($plat)…"
+	mkdir -p "$dest"
+	fetch "https://nodejs.org/dist/${NODE_VERSION}/${plat}.tar.gz" \
+		| tar -xz -C "$dest" --strip-components=1 \
+		|| die "Failed to download Node.js. Check your connection, or install Node $MIN_NODE_MAJOR+ manually."
+
+	NODE_BIN="$dest/bin"
+	NPM="$NODE_BIN/npm"
+	[ -x "$NODE_BIN/node" ] || die "Node download looks incomplete (no $NODE_BIN/node)."
+	ok "Node: $("$NODE_BIN/node" --version) (private copy in $dest)"
+}
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
 if [ "${1:-}" = "--uninstall" ]; then
@@ -62,12 +109,8 @@ find_python() {
 PYTHON="$(find_python)" || die "Python 3.$MIN_PY_MINOR+ not found. Install it from https://python.org (or: brew install python@3.12)."
 ok "Python: $("$PYTHON" --version 2>&1) ($PYTHON)"
 
-# ── Prerequisite: Node ≥ 18 ──────────────────────────────────────────────────
-command -v node >/dev/null 2>&1 || die "Node.js $MIN_NODE_MAJOR+ is required for the TUI. Install it from https://nodejs.org (or: brew install node)."
-command -v npm  >/dev/null 2>&1 || die "npm not found (it ships with Node.js). Reinstall Node.js."
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge "$MIN_NODE_MAJOR" ] || die "Node.js $MIN_NODE_MAJOR+ required, found $(node --version)."
-ok "Node: $(node --version)"
+# Node is provisioned *after* the source is in place (it may be vendored into
+# the install dir). See ensure_node below.
 
 # ── Obtain the source ────────────────────────────────────────────────────────
 SCRIPT_DIR=""
@@ -97,6 +140,10 @@ else
 	git clone --depth 1 "$CRABKEY_REPO_URL" "$CRABKEY_HOME"
 fi
 
+# ── Node (system or vendored) ────────────────────────────────────────────────
+ensure_node
+export PATH="$NODE_BIN:$PATH"   # so npm + tsx's `#!/usr/bin/env node` resolve
+
 # ── Python venv + engine ─────────────────────────────────────────────────────
 info "Creating Python virtual environment…"
 "$PYTHON" -m venv "$CRABKEY_HOME/venv"
@@ -109,7 +156,7 @@ ok "Engine installed."
 
 # ── Ink TUI dependencies ─────────────────────────────────────────────────────
 info "Installing TUI dependencies (npm)…"
-( cd "$CRABKEY_HOME/tui" && npm install --omit=dev --no-audit --no-fund --silent )
+( cd "$CRABKEY_HOME/tui" && "$NPM" install --omit=dev --no-audit --no-fund --silent )
 ok "TUI installed."
 
 # ── Shim on PATH ─────────────────────────────────────────────────────────────
