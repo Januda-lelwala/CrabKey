@@ -31,6 +31,7 @@ from ..safety.permission_broker import Permission, PermissionBroker, PermissionL
 from ..safety.sandbox import Sandbox, SandboxConfig
 from ..tools import default_registry
 from ..tools.shell_tool import ShellTool
+from . import ui
 
 app = typer.Typer(
     name="crabkey",
@@ -38,6 +39,30 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+_CRABKEY_ENV_FILE = Path.home() / ".config" / "crabkey" / "env"
+
+
+def _load_crabkey_env() -> None:
+    """Load API keys from ~/.config/crabkey/env into the current process's environment.
+
+    Keys already present in the environment are NOT overwritten, so shell-level
+    exports always take precedence.  This lets crabkey work immediately after
+    'crabkey configure' without requiring the user to source their shell rc.
+    """
+    if not _CRABKEY_ENV_FILE.exists():
+        return
+    for line in _CRABKEY_ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"\'')
+        os.environ.setdefault(key, val)  # don't override if already set
+
+
+_load_crabkey_env()
 
 
 def _resolve_project(cwd: Path) -> tuple[Path, ProjectConfig, Path]:
@@ -131,31 +156,59 @@ async def _run_async(
         goal = Prompt.ask("[bold cyan]Goal[/bold cyan]")
 
     thread = await thread_mgr.new(name=goal[:60])
-    console.print(Panel(f"[bold]Goal:[/bold] {goal}", title="CrabKey", border_style="cyan"))
+    console.print()
+    console.print(Panel(
+        f"[bold]{goal}[/bold]",
+        title="[bold cyan]Goal[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
 
     if not no_plan:
-        plan = await planner.plan(goal)
+        console.print()
+        ui.section_header(console, "Planning", "▸")
+        with ui.spinner_status(console, "Generating plan…"):
+            plan = await planner.plan(goal)
         if plan.steps:
-            lines = "\n".join(f"{s.index}. {s.description}" + (f" `[{s.tool_hint}]`" if s.tool_hint else "") for s in plan.steps)
-            console.print(Panel(Markdown(lines), title="Plan", border_style="yellow"))
+            lines = "\n".join(f"[bold]{s.index}.[/bold] {s.description}" + (f" [dim][{s.tool_hint}][/dim]" if s.tool_hint else "") for s in plan.steps)
+            console.print(Panel(Markdown(lines), title="[bold]Plan[/bold]", border_style="yellow", padding=(1, 2)))
+
+    console.print()
+    ui.section_header(console, "Execution", "▸")
+    console.print()
 
     def on_event(evt: StepEvent) -> None:
         if evt.kind == "text" and evt.data:
             console.print(Markdown(evt.data))
         elif evt.kind == "tool_call":
-            console.print(f"  [dim]→ {evt.tool_name}({evt.data[:120]}...)[/dim]" if len(evt.data) > 120 else f"  [dim]→ {evt.tool_name}({evt.data})[/dim]")
+            tool_snippet = evt.data[:80] + ("…" if len(evt.data) > 80 else "")
+            console.print(f"  [cyan]→[/cyan] [dim]{evt.tool_name}({tool_snippet})[/dim]")
         elif evt.kind == "tool_result":
-            preview = evt.data[:200].replace("\n", " ")
-            console.print(f"  [dim]← {preview}[/dim]")
+            preview = evt.data[:150].replace("\n", " ")
+            console.print(f"  [cyan]←[/cyan] [dim]{preview}[/dim]")
         elif evt.kind == "done":
-            console.print("[green]✓ Done[/green]")
+            console.print("[green]✓[/green] [bold]Done[/bold]")
         elif evt.kind == "error":
-            console.print(f"[red]✗ {evt.data}[/red]")
+            console.print(f"[red]✗[/red] {evt.data}")
 
     await loop.run(goal=goal, thread_id=thread.id, model_config=model_config, working_dir=str(cwd), on_event=on_event)
 
     total_in, total_out = await db.total_cost_tokens(thread.id)
-    console.print(f"\n[dim]Tokens: {total_in:,} in / {total_out:,} out · thread {thread.id[:8]}[/dim]")
+    console.print(f"\n[dim]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim]")
+    console.print(f"[dim]Tokens: {total_in:,} in · {total_out:,} out · thread {thread.id[:8]}[/dim]")
+    console.print()
+
+
+@app.command()
+def tui(
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+) -> None:
+    """Launch the beautiful Ink (React) terminal UI."""
+    from .launcher import launch_tui
+
+    raise typer.Exit(launch_tui(cwd, provider, model))
 
 
 @app.command()
@@ -181,7 +234,8 @@ def list_providers_cmd() -> None:
     from rich.table import Table
     from ..mal.provider_registry import list_providers as _list
 
-    table = Table(title="CrabKey Providers", show_lines=False)
+    ui.header_banner(console, "CrabKey Providers")
+    table = Table(title=None, show_lines=False, show_header=True, header_style="bold cyan", padding=(0, 2))
     table.add_column("Name", style="cyan", no_wrap=True)
     table.add_column("Mode", style="dim")
     table.add_column("Env var(s)", style="dim")
@@ -191,7 +245,8 @@ def list_providers_cmd() -> None:
         env = ", ".join(p.env_vars[:2]) or "—"
         table.add_row(p.name, p.api_mode, env, p.description or p.display_name)
 
-    console.print(table)
+    console.print(Panel(table, border_style="cyan", padding=(1, 2)))
+    console.print()
 
 
 @app.command(name="models")
@@ -204,7 +259,7 @@ def list_models_cmd(
 
     profile = get_provider_profile(provider)
     if profile is None:
-        console.print(f"[red]Unknown provider: {provider!r}. Run 'crabkey providers' to see available providers.[/red]")
+        ui.error_message(console, f"Unknown provider: {provider!r}. Run 'crabkey providers' to see available providers.")
         raise typer.Exit(1)
 
     # Try live fetch first, fall back to models.dev catalog, then fallback_models
@@ -222,9 +277,11 @@ def list_models_cmd(
         models = list(profile.fallback_models)
         source = "fallback"
 
-    console.print(f"\n[bold]{profile.display_name or provider}[/bold] models ({source}):\n")
+    console.print()
+    ui.section_header(console, f"{profile.display_name or provider} Models", "▸")
+    console.print(f"[dim]Source: {source}[/dim]\n")
     for m in models:
-        console.print(f"  {m}")
+        console.print(f"  [cyan]•[/cyan] {m}")
     console.print()
 
 
@@ -267,6 +324,16 @@ async def _chat_async(
         project_config.model = model_override
 
     provider = _make_provider(project_config)
+
+    # Pre-flight: warn immediately if the API key is missing rather than
+    # letting the first message fail with a cryptic 401.
+    missing = provider.missing_key()
+    if missing:
+        ui.warning_message(
+            console,
+            f"{missing} is not set. Run [bold]crabkey configure[/bold] or set [bold]{missing}=your-key[/bold]"
+        )
+
     db = Db(db_path)
     await db.initialize()
 
