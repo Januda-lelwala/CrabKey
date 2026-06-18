@@ -9,17 +9,31 @@ import sys
 from pathlib import Path
 
 
-def _repo_root() -> Path:
-    # crabkey/cli/launcher.py → repo root is two parents up from the package.
-    return Path(__file__).resolve().parents[2]
+def _find_tui_dir() -> Path | None:
+    """Locate the Ink TUI source, across editable repos and installed app dirs."""
+    candidates: list[Path] = []
+    env = os.environ.get("CRABKEY_TUI_DIR")
+    if env:
+        candidates.append(Path(env))
+    # Editable / repo layout: crabkey/cli/launcher.py → <root>/tui
+    candidates.append(Path(__file__).resolve().parents[2] / "tui")
+    # install.sh layout: ~/.local/share/crabkey/tui
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    candidates.append(Path(xdg) / "crabkey" / "tui")
+    for c in candidates:
+        if (c / "package.json").exists():
+            return c
+    return None
 
 
 def launch_tui(cwd: Path, provider: str | None, model: str | None) -> int:
-    repo_root = _repo_root()
-    tui_dir = repo_root / "tui"
-
-    if not tui_dir.exists():
-        print(f"error: TUI directory not found at {tui_dir}", file=sys.stderr)
+    tui_dir = _find_tui_dir()
+    if tui_dir is None:
+        print(
+            "error: could not locate the CrabKey TUI source.\n"
+            "  Set CRABKEY_TUI_DIR to the directory containing tui/package.json.",
+            file=sys.stderr,
+        )
         return 1
 
     node = shutil.which("node")
@@ -42,7 +56,9 @@ def launch_tui(cwd: Path, provider: str | None, model: str | None) -> int:
 
     env = os.environ.copy()
     env["CRABKEY_PYTHON"] = sys.executable
-    env["CRABKEY_REPO"] = str(repo_root)
+    # cwd for the spawned engine: the parent of tui/ holds the crabkey package
+    # in source layouts; harmless when crabkey is importable globally (editable).
+    env["CRABKEY_REPO"] = str(tui_dir.parent)
     env["CRABKEY_CWD"] = str(Path(cwd).resolve())
     if provider:
         env["CRABKEY_PROVIDER"] = provider
