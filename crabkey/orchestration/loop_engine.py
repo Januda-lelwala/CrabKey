@@ -37,7 +37,7 @@ class LoopConfig:
 
 @dataclass
 class StepEvent:
-    kind: str                   # "text" | "tool_call" | "tool_result" | "done" | "error"
+    kind: str                   # "text" | "text_delta" | "tool_call" | "tool_result" | "done" | "error"
     data: str = ""
     tool_name: str | None = None
     iteration: int = 0
@@ -91,11 +91,22 @@ class LoopEngine:
                 await self._fire(HookEvent.PRE_TURN, {"iteration": iteration, "history": history})
 
                 prompt = await self._assembler.build(history, base_system=model_config.system)
-                resp = await self._provider.complete(prompt, model_config, tools=self._tools.schemas())
+
+                streaming = self._config.stream and hasattr(self._provider, "stream_complete")
+                if streaming:
+                    def on_text(delta: str, _it: int = iteration) -> None:
+                        if on_event:
+                            on_event(StepEvent(kind="text_delta", data=delta, iteration=_it))
+                    resp = await self._provider.stream_complete(
+                        prompt, model_config, tools=self._tools.schemas(), on_text=on_text
+                    )
+                else:
+                    resp = await self._provider.complete(prompt, model_config, tools=self._tools.schemas())
 
                 await self._db.log_cost(thread_id, resp.model, resp.usage.input_tokens, resp.usage.output_tokens)
 
-                if resp.message.content:
+                # In streaming mode the text was already emitted via text_delta events.
+                if resp.message.content and not streaming:
                     if on_event:
                         on_event(StepEvent(kind="text", data=resp.message.content, iteration=iteration))
 

@@ -17,12 +17,77 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from .message import CompletionResponse, Message, Role, ToolCall, ToolResult, Usage
 from .profile import ProviderProfile
 from .provider import ModelConfig, ModelProvider, ToolSchema
 from .transport import NormalizedResponse, get_transport
+
+_STOP_REASON_MAP = {
+    "stop": "end_turn",
+    "tool_calls": "tool_use",
+    "length": "max_tokens",
+    "content_filter": "refusal",
+}
+
+
+async def _accumulate_openai_stream(
+    stream: Any,
+    model: str,
+    on_text: Callable[[str], None] | None,
+) -> CompletionResponse:
+    """Consume an OpenAI-style streaming response, emitting text deltas via
+    *on_text* while reassembling the full message — including tool calls, which
+    arrive fragmented across chunks — into a CompletionResponse."""
+    content_parts: list[str] = []
+    tool_frags: dict[int, dict[str, Any]] = {}
+    finish_reason: str | None = None
+    usage = Usage()
+
+    async for chunk in stream:
+        u = getattr(chunk, "usage", None)
+        if u is not None:
+            usage = Usage(
+                input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+                output_tokens=getattr(u, "completion_tokens", 0) or 0,
+            )
+        if not getattr(chunk, "choices", None):
+            continue
+        choice = chunk.choices[0]
+        if getattr(choice, "finish_reason", None):
+            finish_reason = choice.finish_reason
+        delta = choice.delta
+        text = getattr(delta, "content", None)
+        if text:
+            content_parts.append(text)
+            if on_text:
+                on_text(text)
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            frag = tool_frags.setdefault(tc.index, {"id": None, "name": "", "args": ""})
+            if getattr(tc, "id", None):
+                frag["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    frag["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    frag["args"] += fn.arguments
+
+    tool_calls: list[ToolCall] = []
+    for idx in sorted(tool_frags):
+        frag = tool_frags[idx]
+        try:
+            args = json.loads(frag["args"]) if frag["args"] else {}
+        except json.JSONDecodeError:
+            args = {}
+        tool_calls.append(ToolCall(id=frag["id"] or "", name=frag["name"], arguments=args))
+
+    msg = Message(role=Role.ASSISTANT, content="".join(content_parts) or None, tool_calls=tool_calls)
+    stop = _STOP_REASON_MAP.get(
+        finish_reason, finish_reason or ("tool_use" if tool_calls else "end_turn")
+    )
+    return CompletionResponse(message=msg, usage=usage, model=model, stop_reason=stop)
 
 
 def _resolve_api_key(profile: ProviderProfile, override: str | None = None) -> str | None:
@@ -277,6 +342,50 @@ class PluginModelProvider(ModelProvider):
                 delta = chunk.choices[0].delta.content if chunk.choices else None
                 if delta:
                     yield delta
+
+    async def stream_complete(
+        self,
+        messages: list[Message],
+        config: ModelConfig,
+        tools: list[ToolSchema] | None = None,
+        *,
+        on_text: Callable[[str], None] | None = None,
+        provider_preferences: dict[str, Any] | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> CompletionResponse:
+        """Like complete(), but streams text deltas to *on_text* as they arrive.
+
+        Unlike stream(), this preserves tool calls and returns the full
+        CompletionResponse, so it is safe to drive the agentic loop with."""
+        client = self._get_client()
+        wire_messages = _messages_to_openai_wire(messages)
+        wire_tools = self._tool_schemas_to_wire(tools)
+
+        params = self._base_params(config, {
+            "provider_preferences": provider_preferences,
+            "reasoning_config": reasoning_config,
+            "session_id": session_id,
+        })
+        kwargs = self._transport.build_kwargs(
+            model=config.model,
+            messages=wire_messages,
+            tools=wire_tools,
+            **params,
+        )
+
+        if self._profile.api_mode == "anthropic_messages":
+            async with client.messages.stream(**kwargs) as stream_ctx:
+                async for text in stream_ctx.text_stream:
+                    if on_text:
+                        on_text(text)
+                final = await stream_ctx.get_final_message()
+            normalized = self._transport.normalize_response(final)
+            return _normalized_to_completion(normalized, config.model)
+
+        kwargs["stream"] = True
+        stream = await client.chat.completions.create(**kwargs)
+        return await _accumulate_openai_stream(stream, config.model, on_text)
 
     def count_tokens(self, messages: list[Message], config: ModelConfig) -> int:
         total = sum(len(m.content or "") for m in messages)

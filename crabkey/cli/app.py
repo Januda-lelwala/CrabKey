@@ -36,11 +36,15 @@ from ..safety.permission_broker import (
 )
 from ..safety.sandbox import Sandbox, SandboxConfig
 from ..tools import default_registry, load_mcp_servers
+from ..tools.memory_tool import SaveMemoryTool
 from ..tools.shell_tool import ShellTool
 from . import ui
 
 # Tools that never mutate the workspace — always safe to auto-approve.
-_READONLY_TOOLS = ("file.read", "file.list", "web.fetch", "web.search")
+_READONLY_TOOLS = (
+    "file.read", "file.list", "search.grep", "search.glob",
+    "web.fetch", "web.search", "memory.save",
+)
 # Tools that change files — auto-approved in auto-edit mode, asked otherwise.
 _EDIT_TOOLS = ("file.write", "file.edit")
 
@@ -188,6 +192,7 @@ async def _run_async(
     sandbox = Sandbox(SandboxConfig(allowed_paths=[cwd]))
     tools = default_registry()
     tools.register(ShellTool(sandbox=sandbox))
+    tools.register(SaveMemoryTool(context_file=context_file))
 
     # Register any MCP servers declared in .crabkey/config.toml ([[mcp_servers]]).
     mcp_clients = await load_mcp_servers(project_config.mcp_servers, tools)
@@ -245,7 +250,23 @@ async def _run_async(
     ui.section_header(console, "Execution", "▸")
     console.print()
 
+    # Tracks whether we're mid-stream so we can flush a newline before the next
+    # non-delta event (tool call / done) renders.
+    stream_state = {"active": False}
+
+    def _end_stream() -> None:
+        if stream_state["active"]:
+            console.file.write("\n")
+            console.file.flush()
+            stream_state["active"] = False
+
     def on_event(evt: StepEvent) -> None:
+        if evt.kind == "text_delta":
+            console.file.write(evt.data)
+            console.file.flush()
+            stream_state["active"] = True
+            return
+        _end_stream()
         if evt.kind == "text" and evt.data:
             console.print(Markdown(evt.data))
         elif evt.kind == "tool_call":
