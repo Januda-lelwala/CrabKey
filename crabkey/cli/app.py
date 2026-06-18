@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -16,6 +18,7 @@ from rich.text import Text
 from ..cognition.context_assembler import ContextAssembler
 from ..cognition.memory_manager import MemoryManager
 from ..cognition.reflector import Reflector
+from ..mal.message import Message, Role
 from ..mal.plugin_provider import PluginModelProvider
 from ..mal.provider import ModelConfig
 from ..mal.provider_registry import get_provider_profile, list_providers
@@ -39,6 +42,33 @@ from ..tools import default_registry, load_mcp_servers
 from ..tools.memory_tool import SaveMemoryTool
 from ..tools.shell_tool import ShellTool
 from . import ui
+from .commands import load_custom_commands
+from .extensions import load_extensions
+
+_GLOBAL_CONTEXT_FILE = Path.home() / ".config" / "crabkey" / "CONTEXT.md"
+_GLOBAL_COMMANDS_DIR = Path.home() / ".config" / "crabkey" / "commands"
+
+
+def _make_summarizer(provider: PluginModelProvider, model: str):
+    """Build a provider-backed summarizer for compressing dropped history."""
+    cfg = ModelConfig(model=model, max_tokens=512)
+
+    async def summarize(messages: list[Message]) -> str:
+        excerpt = "\n".join(f"[{m.role.value}] {m.content or ''}" for m in messages)
+        prompt = [
+            Message(role=Role.SYSTEM, content=(
+                "Summarize this earlier portion of a coding session concisely, "
+                "preserving decisions made, file paths touched, and any open tasks."
+            )),
+            Message(role=Role.USER, content=excerpt),
+        ]
+        try:
+            resp = await provider.complete(prompt, cfg)
+            return resp.message.content or ""
+        except Exception:
+            return ""  # summarization is best-effort; never break the loop
+
+    return summarize
 
 # Tools that never mutate the workspace — always safe to auto-approve.
 _READONLY_TOOLS = (
@@ -152,10 +182,26 @@ def run(
     allow_all: bool = typer.Option(False, "--allow-all", "--yolo", help="Auto-approve ALL tools (dangerous)."),
     auto_edit: bool = typer.Option(False, "--auto-edit", help="Auto-approve file edits; still ask for shell."),
     no_checkpoint: bool = typer.Option(False, "--no-checkpoint", help="Disable git checkpoints before edits."),
+    output: str = typer.Option("text", "--output", "-o", help="Output format: text or json (json implies headless)."),
     cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
 ) -> None:
-    """Run CrabKey in agent mode toward a goal."""
-    asyncio.run(_run_async(goal, model, provider, max_iter, no_plan, allow_all, auto_edit, no_checkpoint, cwd))
+    """Run CrabKey in agent mode toward a goal.
+
+    Headless usage: pipe the goal on stdin (e.g. `echo "fix the bug" | crabkey run`)
+    and/or pass `--output json` for machine-readable results and exit codes.
+    """
+    # Read the goal from stdin when piped and no goal argument was given.
+    if goal is None and not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        goal = piped or None
+
+    if output not in ("text", "json"):
+        raise typer.BadParameter("--output must be 'text' or 'json'.")
+
+    code = asyncio.run(_run_async(
+        goal, model, provider, max_iter, no_plan, allow_all, auto_edit, no_checkpoint, output, cwd
+    ))
+    raise typer.Exit(code)
 
 
 async def _run_async(
@@ -167,8 +213,9 @@ async def _run_async(
     allow_all: bool,
     auto_edit: bool,
     no_checkpoint: bool,
+    output: str,
     cwd: Path,
-) -> None:
+) -> int:
     config_dir, project_config, db_path = _resolve_project(cwd)
 
     if provider_override:
@@ -176,28 +223,45 @@ async def _run_async(
     if model_override:
         project_config.model = model_override
 
+    headless = output == "json"
+
     provider = _make_provider(project_config)
     db = Db(db_path)
     await db.initialize()
 
+    # Extensions bundle MCP servers + context + commands under .crabkey/extensions/.
+    extensions = load_extensions(cwd)
+
     context_file = config_dir / "CONTEXT.md"
-    memory = MemoryManager(context_file=context_file)
-    assembler = ContextAssembler(memory)
+    memory = MemoryManager(
+        context_file=context_file,
+        global_context_file=_GLOBAL_CONTEXT_FILE,
+        extra_context_files=extensions.context_files,
+    )
+    summarizer = _make_summarizer(provider, project_config.model)
+    assembler = ContextAssembler(memory, summarizer=summarizer)
     reflector = Reflector(provider)
     planner = Planner(provider)
     thread_mgr = ThreadManager(db)
 
+    # In headless mode there is no human to answer prompts, so never use the
+    # interactive approver — ASK-level tools are refused unless --yolo/--auto-edit.
     broker, approver = _build_broker(allow_all, auto_edit)
+    if headless:
+        approver = None
 
     sandbox = Sandbox(SandboxConfig(allowed_paths=[cwd]))
     tools = default_registry()
     tools.register(ShellTool(sandbox=sandbox))
     tools.register(SaveMemoryTool(context_file=context_file))
 
-    # Register any MCP servers declared in .crabkey/config.toml ([[mcp_servers]]).
-    mcp_clients = await load_mcp_servers(project_config.mcp_servers, tools)
-    if mcp_clients:
+    # Register MCP servers from config ([[mcp_servers]]) plus any from extensions.
+    all_mcp_servers = list(project_config.mcp_servers) + extensions.mcp_servers
+    mcp_clients = await load_mcp_servers(all_mcp_servers, tools)
+    if mcp_clients and not headless:
         console.print(f"[dim]Connected {len(mcp_clients)} MCP server(s).[/dim]")
+    if extensions.names and not headless:
+        console.print(f"[dim]Loaded extensions: {', '.join(extensions.names)}.[/dim]")
 
     # Checkpoints require a git repo; silently skip if this isn't one.
     checkpoint: Checkpoint | None = None
@@ -226,29 +290,42 @@ async def _run_async(
     )
 
     if goal is None:
+        if headless:
+            console.print(json.dumps({"status": "error", "error": "No goal provided."}))
+            return 2
         goal = Prompt.ask("[bold cyan]Goal[/bold cyan]")
 
     thread = await thread_mgr.new(name=goal[:60])
-    console.print()
-    console.print(Panel(
-        f"[bold]{goal}[/bold]",
-        title="[bold cyan]Goal[/bold cyan]",
-        border_style="cyan",
-        padding=(1, 2),
-    ))
+
+    if not headless:
+        console.print()
+        console.print(Panel(
+            f"[bold]{goal}[/bold]",
+            title="[bold cyan]Goal[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 2),
+        ))
 
     if not no_plan:
-        console.print()
-        ui.section_header(console, "Planning", "▸")
-        with ui.spinner_status(console, "Generating plan…"):
+        if headless:
             plan = await planner.plan(goal)
-        if plan.steps:
-            lines = "\n".join(f"[bold]{s.index}.[/bold] {s.description}" + (f" [dim][{s.tool_hint}][/dim]" if s.tool_hint else "") for s in plan.steps)
-            console.print(Panel(Markdown(lines), title="[bold]Plan[/bold]", border_style="yellow", padding=(1, 2)))
+        else:
+            console.print()
+            ui.section_header(console, "Planning", "▸")
+            with ui.spinner_status(console, "Generating plan…"):
+                plan = await planner.plan(goal)
+            if plan.steps:
+                lines = "\n".join(f"[bold]{s.index}.[/bold] {s.description}" + (f" [dim][{s.tool_hint}][/dim]" if s.tool_hint else "") for s in plan.steps)
+                console.print(Panel(Markdown(lines), title="[bold]Plan[/bold]", border_style="yellow", padding=(1, 2)))
 
-    console.print()
-    ui.section_header(console, "Execution", "▸")
-    console.print()
+    if not headless:
+        console.print()
+        ui.section_header(console, "Execution", "▸")
+        console.print()
+
+    # Collected for JSON output; ignored in text mode.
+    collected: list[dict] = []
+    saw_error = {"value": False}
 
     # Tracks whether we're mid-stream so we can flush a newline before the next
     # non-delta event (tool call / done) renders.
@@ -261,6 +338,11 @@ async def _run_async(
             stream_state["active"] = False
 
     def on_event(evt: StepEvent) -> None:
+        if evt.kind == "error":
+            saw_error["value"] = True
+        if headless:
+            collected.append({"kind": evt.kind, "tool": evt.tool_name, "data": evt.data, "iteration": evt.iteration})
+            return
         if evt.kind == "text_delta":
             console.file.write(evt.data)
             console.file.flush()
@@ -280,16 +362,40 @@ async def _run_async(
         elif evt.kind == "error":
             console.print(f"[red]✗[/red] {evt.data}")
 
+    exit_code = 0
     try:
-        await loop.run(goal=goal, thread_id=thread.id, model_config=model_config, working_dir=str(cwd), on_event=on_event)
+        history = await loop.run(goal=goal, thread_id=thread.id, model_config=model_config, working_dir=str(cwd), on_event=on_event)
+    except Exception as exc:
+        if headless:
+            console.print(json.dumps({"status": "error", "error": str(exc), "thread_id": thread.id}))
+        else:
+            console.print(f"[red]✗[/red] {exc}")
+        return 1
     finally:
         for client in mcp_clients:
             await client.stop()
 
     total_in, total_out = await db.total_cost_tokens(thread.id)
+
+    if headless:
+        final_text = next(
+            (m.content for m in reversed(history) if m.role == Role.ASSISTANT and m.content),
+            "",
+        )
+        console.print(json.dumps({
+            "status": "error" if saw_error["value"] else "ok",
+            "goal": goal,
+            "thread_id": thread.id,
+            "result": final_text,
+            "events": collected,
+            "tokens": {"input": total_in, "output": total_out},
+        }))
+        return 1 if saw_error["value"] else 0
+
     console.print(f"\n[dim]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim]")
     console.print(f"[dim]Tokens: {total_in:,} in · {total_out:,} out · thread {thread.id[:8]}[/dim]")
     console.print()
+    return exit_code
 
 
 @app.command()
@@ -490,6 +596,14 @@ async def _chat_async(
         ),
     )
 
+    # Discover custom slash commands: global, then extensions, then project
+    # (later dirs override earlier ones on name collision).
+    extensions = load_extensions(cwd)
+    command_dirs = [_GLOBAL_COMMANDS_DIR, *extensions.command_dirs, config_dir / "commands"]
+    custom_commands = load_custom_commands(command_dirs)
+    if custom_commands:
+        console.print(f"[dim]Loaded {len(custom_commands)} custom command(s). Type /help to see them.[/dim]")
+
     ctx = ConversationContext(session_mgr, thread_mgr, db)
     repl = Repl(
         ctx=ctx,
@@ -498,6 +612,7 @@ async def _chat_async(
         provider=provider,
         model_config=model_config,
         console=console,
+        custom_commands=custom_commands,
     )
     await repl.run()
 
