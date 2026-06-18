@@ -2,7 +2,7 @@ from .base import Tool, ToolContext, ToolRegistry
 from .file_tool import FileEditTool, FileListTool, FileReadTool, FileWriteTool
 from .shell_tool import ShellTool
 from .web_tool import WebFetchTool, WebSearchTool
-from .mcp_client import McpClient, McpServerConfig, McpProxyTool
+from .mcp_client import McpClient, McpServerConfig, McpProxyTool, load_mcp_servers
 
 
 def default_registry() -> ToolRegistry:
@@ -18,6 +18,6 @@ __all__ = [
     "FileReadTool", "FileWriteTool", "FileEditTool", "FileListTool",
     "ShellTool",
     "WebFetchTool", "WebSearchTool",
-    "McpClient", "McpServerConfig", "McpProxyTool",
+    "McpClient", "McpServerConfig", "McpProxyTool", "load_mcp_servers",
     "default_registry",
 ]

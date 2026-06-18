@@ -27,11 +27,22 @@ from ..orchestration.thread_manager import ThreadManager
 from ..persistence.config import ProjectConfig
 from ..persistence.db import Db
 from ..safety.checkpoint import Checkpoint
-from ..safety.permission_broker import Permission, PermissionBroker, PermissionLevel
+from ..safety.permission_broker import (
+    ApprovalDecision,
+    Approver,
+    Permission,
+    PermissionBroker,
+    PermissionLevel,
+)
 from ..safety.sandbox import Sandbox, SandboxConfig
-from ..tools import default_registry
+from ..tools import default_registry, load_mcp_servers
 from ..tools.shell_tool import ShellTool
 from . import ui
+
+# Tools that never mutate the workspace — always safe to auto-approve.
+_READONLY_TOOLS = ("file.read", "file.list", "web.fetch", "web.search")
+# Tools that change files — auto-approved in auto-edit mode, asked otherwise.
+_EDIT_TOOLS = ("file.write", "file.edit")
 
 app = typer.Typer(
     name="crabkey",
@@ -84,6 +95,49 @@ def _make_provider(config: ProjectConfig) -> PluginModelProvider:
         )
 
 
+def _make_approver(broker: PermissionBroker) -> Approver:
+    """Build an interactive approver that prompts the user for ASK-level tools."""
+
+    def approve(tool: str, arg: str | None) -> ApprovalDecision:
+        console.print()
+        detail = f" [dim]{arg}[/dim]" if arg else ""
+        console.print(f"  [yellow]⚠[/yellow] [bold]{tool}[/bold] wants to run:{detail}")
+        choice = Prompt.ask(
+            "    Allow?",
+            choices=["y", "n", "a"],
+            default="y",
+            show_choices=True,
+        )
+        if choice == "n":
+            return ApprovalDecision.DENY
+        if choice == "a":
+            return ApprovalDecision.ALLOW_ALWAYS
+        return ApprovalDecision.ALLOW_ONCE
+
+    return approve
+
+
+def _build_broker(allow_all: bool, auto_edit: bool) -> tuple[PermissionBroker, Approver | None]:
+    """Configure the permission broker for the chosen approval mode.
+
+    - allow_all (YOLO): everything is auto-approved, no prompts.
+    - auto_edit: reads + file edits auto-approved, shell still asks.
+    - default: only read-only tools auto-approved; edits and shell ask.
+    """
+    broker = PermissionBroker()
+    if allow_all:
+        broker.add_rule(Permission(tool="*", level=PermissionLevel.ALLOW))
+        return broker, None
+
+    for t in _READONLY_TOOLS:
+        broker.add_rule(Permission(tool=t, level=PermissionLevel.ALLOW))
+    if auto_edit:
+        for t in _EDIT_TOOLS:
+            broker.add_rule(Permission(tool=t, level=PermissionLevel.ALLOW))
+    # Everything else (edits when not auto-edit, shell.run, MCP tools) → ASK.
+    return broker, _make_approver(broker)
+
+
 @app.command()
 def run(
     goal: Optional[str] = typer.Argument(None, help="Goal for the agent. If omitted, enters interactive mode."),
@@ -91,11 +145,13 @@ def run(
     provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
     max_iter: int = typer.Option(20, "--max-iter", help="Maximum loop iterations."),
     no_plan: bool = typer.Option(False, "--no-plan", help="Skip the planning step."),
-    allow_all: bool = typer.Option(False, "--allow-all", help="Grant ALLOW to all tools (dangerous)."),
+    allow_all: bool = typer.Option(False, "--allow-all", "--yolo", help="Auto-approve ALL tools (dangerous)."),
+    auto_edit: bool = typer.Option(False, "--auto-edit", help="Auto-approve file edits; still ask for shell."),
+    no_checkpoint: bool = typer.Option(False, "--no-checkpoint", help="Disable git checkpoints before edits."),
     cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
 ) -> None:
     """Run CrabKey in agent mode toward a goal."""
-    asyncio.run(_run_async(goal, model, provider, max_iter, no_plan, allow_all, cwd))
+    asyncio.run(_run_async(goal, model, provider, max_iter, no_plan, allow_all, auto_edit, no_checkpoint, cwd))
 
 
 async def _run_async(
@@ -105,6 +161,8 @@ async def _run_async(
     max_iter: int,
     no_plan: bool,
     allow_all: bool,
+    auto_edit: bool,
+    no_checkpoint: bool,
     cwd: Path,
 ) -> None:
     config_dir, project_config, db_path = _resolve_project(cwd)
@@ -125,16 +183,23 @@ async def _run_async(
     planner = Planner(provider)
     thread_mgr = ThreadManager(db)
 
-    broker = PermissionBroker()
-    if allow_all:
-        broker.add_rule(Permission(tool="*", level=PermissionLevel.ALLOW))
-    else:
-        for t in ["file.read", "file.list", "file.write", "file.edit", "shell.run", "web.fetch"]:
-            broker.add_rule(Permission(tool=t, level=PermissionLevel.ALLOW))
+    broker, approver = _build_broker(allow_all, auto_edit)
 
     sandbox = Sandbox(SandboxConfig(allowed_paths=[cwd]))
     tools = default_registry()
     tools.register(ShellTool(sandbox=sandbox))
+
+    # Register any MCP servers declared in .crabkey/config.toml ([[mcp_servers]]).
+    mcp_clients = await load_mcp_servers(project_config.mcp_servers, tools)
+    if mcp_clients:
+        console.print(f"[dim]Connected {len(mcp_clients)} MCP server(s).[/dim]")
+
+    # Checkpoints require a git repo; silently skip if this isn't one.
+    checkpoint: Checkpoint | None = None
+    if not no_checkpoint and (cwd / ".git").exists():
+        checkpoint = Checkpoint(repo_root=cwd)
+
+    hooks = HookDispatcher()
 
     model_config = ModelConfig(
         model=project_config.model,
@@ -150,6 +215,9 @@ async def _run_async(
         broker=broker,
         reflector=reflector,
         config=LoopConfig(max_iterations=max_iter),
+        hooks=hooks,
+        checkpoint=checkpoint,
+        approver=approver,
     )
 
     if goal is None:
@@ -191,7 +259,11 @@ async def _run_async(
         elif evt.kind == "error":
             console.print(f"[red]✗[/red] {evt.data}")
 
-    await loop.run(goal=goal, thread_id=thread.id, model_config=model_config, working_dir=str(cwd), on_event=on_event)
+    try:
+        await loop.run(goal=goal, thread_id=thread.id, model_config=model_config, working_dir=str(cwd), on_event=on_event)
+    finally:
+        for client in mcp_clients:
+            await client.stop()
 
     total_in, total_out = await db.total_cost_tokens(thread.id)
     console.print(f"\n[dim]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim]")
@@ -226,6 +298,42 @@ async def _list_threads(cwd: Path) -> None:
     thread_mgr = ThreadManager(db)
     for t in thread_mgr.list():
         console.print(f"  {t.id[:8]}  {t.name}")
+
+
+@app.command()
+def restore(
+    sha: Optional[str] = typer.Argument(None, help="Checkpoint SHA to restore. Omit to list checkpoints."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+) -> None:
+    """List CrabKey git checkpoints, or restore the workspace to one (hard reset)."""
+    asyncio.run(_restore_async(sha, cwd))
+
+
+async def _restore_async(sha: str | None, cwd: Path) -> None:
+    if not (cwd / ".git").exists():
+        ui.error_message(console, f"{cwd} is not a git repository — no checkpoints available.")
+        raise typer.Exit(1)
+
+    ckpt = Checkpoint(repo_root=cwd)
+    checkpoints = await ckpt.list()
+
+    if sha is None:
+        if not checkpoints:
+            console.print("[dim]No CrabKey checkpoints found.[/dim]")
+            return
+        console.print()
+        ui.section_header(console, "Checkpoints", "▸")
+        for info in checkpoints:
+            console.print(f"  [cyan]{info.sha[:8]}[/cyan]  {info.label}")
+        console.print("\n[dim]Restore with: crabkey restore <sha>[/dim]\n")
+        return
+
+    match = next((c for c in checkpoints if c.sha.startswith(sha)), None)
+    if match is None:
+        ui.error_message(console, f"No checkpoint matching {sha!r}. Run 'crabkey restore' to list them.")
+        raise typer.Exit(1)
+    await ckpt.restore(match)
+    console.print(f"[green]✓[/green] Restored workspace to [cyan]{match.sha[:8]}[/cyan] ({match.label})")
 
 
 @app.command(name="providers")
