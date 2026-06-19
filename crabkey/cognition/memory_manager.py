@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..persistence.vector_store import InMemoryVectorStore, VectorDocument, VectorStore
+from .context_files import load_context
 
 
 class MemoryKind(str, Enum):
@@ -28,9 +29,17 @@ class MemoryManager:
     Episodic memories are kept in-process; procedural/semantic use the vector store.
     """
 
-    def __init__(self, vector_store: VectorStore | None = None, context_file: Path | None = None) -> None:
+    def __init__(
+        self,
+        vector_store: VectorStore | None = None,
+        context_file: Path | None = None,
+        global_context_file: Path | None = None,
+        extra_context_files: list[Path] | None = None,
+    ) -> None:
         self._vector_store = vector_store or InMemoryVectorStore()
         self._context_file = context_file
+        self._global_context_file = global_context_file
+        self._extra_context_files = extra_context_files or []
         self._episodic: list[MemoryEntry] = []
 
     async def store(self, entry: MemoryEntry, embedding: list[float] | None = None) -> None:
@@ -55,9 +64,15 @@ class MemoryManager:
         return self._episodic[-n:]
 
     def load_context_file(self) -> str | None:
-        if self._context_file and self._context_file.exists():
-            return self._context_file.read_text(encoding="utf-8")
-        return None
+        """Load the merged context document: global context first, then project,
+        with @imports resolved. Returns None if no context files exist."""
+        files: list[Path] = []
+        if self._global_context_file:
+            files.append(self._global_context_file)
+        files.extend(self._extra_context_files)  # e.g. extension contexts
+        if self._context_file:
+            files.append(self._context_file)  # project context is most specific
+        return load_context(files)
 
     def update_context_file(self, content: str) -> None:
         if self._context_file:

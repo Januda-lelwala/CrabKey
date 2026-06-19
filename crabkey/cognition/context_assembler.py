@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Awaitable, Callable
 
 from ..mal.message import Message, Role
 from .memory_manager import MemoryEntry, MemoryManager
+
+# Summarizes a list of older messages into a compact text note.
+Summarizer = Callable[[list[Message]], Awaitable[str]]
 
 
 @dataclass
@@ -21,14 +24,26 @@ class ContextAssembler:
     Memory stores — ContextAssembler decides what to include this turn.
     """
 
-    def __init__(self, memory: MemoryManager, budget: ContextBudget | None = None) -> None:
+    def __init__(
+        self,
+        memory: MemoryManager,
+        budget: ContextBudget | None = None,
+        summarizer: Summarizer | None = None,
+    ) -> None:
         self._memory = memory
         self._budget = budget or ContextBudget()
+        self._summarizer = summarizer
 
     def _rough_tokens(self, text: str) -> int:
         return len(text) // 4
 
-    def _build_system(self, base_system: str | None, context_doc: str | None, memories: list[MemoryEntry]) -> str:
+    def _build_system(
+        self,
+        base_system: str | None,
+        context_doc: str | None,
+        memories: list[MemoryEntry],
+        summary: str | None = None,
+    ) -> str:
         parts: list[str] = []
         if base_system:
             parts.append(base_system)
@@ -37,6 +52,8 @@ class ContextAssembler:
         if memories:
             mem_text = "\n".join(f"- {m.text}" for m in memories)
             parts.append(f"<relevant_memories>\n{mem_text}\n</relevant_memories>")
+        if summary:
+            parts.append(f"<conversation_summary>\n{summary}\n</conversation_summary>")
         return "\n\n".join(parts)
 
     def _trim_history(self, history: list[Message], token_budget: int) -> list[Message]:
@@ -66,6 +83,14 @@ class ContextAssembler:
         system_text = self._build_system(base_system, context_doc, memories)
         history_budget = self._budget.max_tokens - self._rough_tokens(system_text) - self._budget.system_reserve
         trimmed_history = self._trim_history(history, history_budget)
+
+        # If history overflowed and a summarizer is available, compress the dropped
+        # older messages into a summary rather than silently discarding them.
+        dropped = history[: len(history) - len(trimmed_history)]
+        if dropped and self._summarizer is not None:
+            summary = await self._summarizer(dropped)
+            if summary:
+                system_text = self._build_system(base_system, context_doc, memories, summary)
 
         messages: list[Message] = []
         if system_text:

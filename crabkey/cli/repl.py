@@ -108,6 +108,7 @@ class Repl:
         provider: Any,
         model_config: ModelConfig,
         console: Console,
+        custom_commands: dict | None = None,
     ) -> None:
         self._ctx = ctx
         self._session_mgr = session_mgr
@@ -115,6 +116,7 @@ class Repl:
         self._provider = provider
         self._model_config = model_config
         self._console = console
+        self._custom_commands = custom_commands or {}
         self._running = False
 
     # ── Slash commands ────────────────────────────────────────────────────────
@@ -267,7 +269,13 @@ class Repl:
         self._console.print(Panel(table, title="[bold]Status[/bold]", border_style="dim", padding=(1, 2)))
 
     def _cmd_help(self) -> None:
-        self._console.print(Panel(__doc__ or "", title="[bold]CrabKey Commands[/bold]", border_style="dim", padding=(1, 2)))
+        body = __doc__ or ""
+        if self._custom_commands:
+            lines = "\n".join(
+                f"    /{c.name:<22} {c.description}" for c in self._custom_commands.values()
+            )
+            body = f"{body}\nCustom commands:\n{lines}\n"
+        self._console.print(Panel(body, title="[bold]CrabKey Commands[/bold]", border_style="dim", padding=(1, 2)))
 
     # ── Error formatting ──────────────────────────────────────────────────────
 
@@ -332,10 +340,22 @@ class Repl:
             self._console.clear()
         elif cmd in ("quit", "q", "exit"):
             return False
+        elif cmd in self._custom_commands:
+            await self._run_custom_command(cmd, args)
         else:
             ui.warning_message(self._console, f"Unknown command: /{cmd}  — try /help")
 
         return True
+
+    async def _run_custom_command(self, cmd: str, args: list[str]) -> None:
+        """Expand a custom command template and run it as an LLM turn."""
+        from .commands import expand
+
+        if self._session_mgr.active is None:
+            ui.error_message(self._console, "No active session. Create one first: /session new")
+            return
+        prompt = expand(self._custom_commands[cmd].prompt, " ".join(args))
+        await self._llm_turn(prompt)
 
     # ── LLM turn ─────────────────────────────────────────────────────────────
 

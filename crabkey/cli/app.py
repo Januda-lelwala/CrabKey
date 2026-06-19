@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -16,9 +18,12 @@ from rich.text import Text
 from ..cognition.context_assembler import ContextAssembler
 from ..cognition.memory_manager import MemoryManager
 from ..cognition.reflector import Reflector
+from ..mal.message import Message, Role
 from ..mal.plugin_provider import PluginModelProvider
 from ..mal.provider import ModelConfig
 from ..mal.provider_registry import get_provider_profile, list_providers
+from ..observability import Telemetry
+from ..orchestration.agent_router import AgentRouter
 from ..orchestration.hook_dispatcher import HookDispatcher
 from ..orchestration.loop_engine import LoopConfig, LoopEngine, StepEvent
 from ..orchestration.planner import Planner
@@ -27,18 +32,77 @@ from ..orchestration.thread_manager import ThreadManager
 from ..persistence.config import ProjectConfig
 from ..persistence.db import Db
 from ..safety.checkpoint import Checkpoint
-from ..safety.permission_broker import Permission, PermissionBroker, PermissionLevel
+from ..safety.permission_broker import (
+    ApprovalDecision,
+    Approver,
+    Permission,
+    PermissionBroker,
+    PermissionLevel,
+)
 from ..safety.sandbox import Sandbox, SandboxConfig
-from ..tools import default_registry
+from ..tools import ToolRegistry, default_registry, load_mcp_servers
+from ..tools.agent_tool import AgentDispatchTool
+from ..tools.memory_tool import SaveMemoryTool
 from ..tools.shell_tool import ShellTool
 from . import ui
+from .extensions import load_extensions
+
+_GLOBAL_CONTEXT_FILE = Path.home() / ".config" / "crabkey" / "CONTEXT.md"
+_GLOBAL_COMMANDS_DIR = Path.home() / ".config" / "crabkey" / "commands"
+
+
+def _make_summarizer(provider: PluginModelProvider, model: str):
+    """Build a provider-backed summarizer for compressing dropped history."""
+    cfg = ModelConfig(model=model, max_tokens=512)
+
+    async def summarize(messages: list[Message]) -> str:
+        excerpt = "\n".join(f"[{m.role.value}] {m.content or ''}" for m in messages)
+        prompt = [
+            Message(role=Role.SYSTEM, content=(
+                "Summarize this earlier portion of a coding session concisely, "
+                "preserving decisions made, file paths touched, and any open tasks."
+            )),
+            Message(role=Role.USER, content=excerpt),
+        ]
+        try:
+            resp = await provider.complete(prompt, cfg)
+            return resp.message.content or ""
+        except Exception:
+            return ""  # summarization is best-effort; never break the loop
+
+    return summarize
+
+# Tools that never mutate the workspace — always safe to auto-approve.
+# agent.dispatch is a meta-tool; the sub-agent's own actions are gated separately.
+_READONLY_TOOLS = (
+    "file.read", "file.list", "search.grep", "search.glob",
+    "web.fetch", "web.search", "memory.save", "agent.dispatch",
+)
+# Tools that change files — auto-approved in auto-edit mode, asked otherwise.
+_EDIT_TOOLS = ("file.write", "file.edit")
 
 app = typer.Typer(
     name="crabkey",
-    help="Model-agnostic agentic coding CLI.",
+    help="Model-agnostic agentic coding CLI. Run `crabkey` with no command to open the interactive UI.",
     add_completion=False,
+    no_args_is_help=False,
 )
 console = Console()
+
+
+@app.callback(invoke_without_command=True)
+def _default(
+    ctx: typer.Context,
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+) -> None:
+    """Open the interactive CrabKey UI when invoked with no subcommand."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from .launcher import launch_tui
+
+    raise typer.Exit(launch_tui(cwd, provider, model))
 
 _CRABKEY_ENV_FILE = Path.home() / ".config" / "crabkey" / "env"
 
@@ -84,6 +148,49 @@ def _make_provider(config: ProjectConfig) -> PluginModelProvider:
         )
 
 
+def _make_approver(broker: PermissionBroker) -> Approver:
+    """Build an interactive approver that prompts the user for ASK-level tools."""
+
+    def approve(tool: str, arg: str | None) -> ApprovalDecision:
+        console.print()
+        detail = f" [dim]{arg}[/dim]" if arg else ""
+        console.print(f"  [yellow]⚠[/yellow] [bold]{tool}[/bold] wants to run:{detail}")
+        choice = Prompt.ask(
+            "    Allow?",
+            choices=["y", "n", "a"],
+            default="y",
+            show_choices=True,
+        )
+        if choice == "n":
+            return ApprovalDecision.DENY
+        if choice == "a":
+            return ApprovalDecision.ALLOW_ALWAYS
+        return ApprovalDecision.ALLOW_ONCE
+
+    return approve
+
+
+def _build_broker(allow_all: bool, auto_edit: bool) -> tuple[PermissionBroker, Approver | None]:
+    """Configure the permission broker for the chosen approval mode.
+
+    - allow_all (YOLO): everything is auto-approved, no prompts.
+    - auto_edit: reads + file edits auto-approved, shell still asks.
+    - default: only read-only tools auto-approved; edits and shell ask.
+    """
+    broker = PermissionBroker()
+    if allow_all:
+        broker.add_rule(Permission(tool="*", level=PermissionLevel.ALLOW))
+        return broker, None
+
+    for t in _READONLY_TOOLS:
+        broker.add_rule(Permission(tool=t, level=PermissionLevel.ALLOW))
+    if auto_edit:
+        for t in _EDIT_TOOLS:
+            broker.add_rule(Permission(tool=t, level=PermissionLevel.ALLOW))
+    # Everything else (edits when not auto-edit, shell.run, MCP tools) → ASK.
+    return broker, _make_approver(broker)
+
+
 @app.command()
 def run(
     goal: Optional[str] = typer.Argument(None, help="Goal for the agent. If omitted, enters interactive mode."),
@@ -91,11 +198,29 @@ def run(
     provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
     max_iter: int = typer.Option(20, "--max-iter", help="Maximum loop iterations."),
     no_plan: bool = typer.Option(False, "--no-plan", help="Skip the planning step."),
-    allow_all: bool = typer.Option(False, "--allow-all", help="Grant ALLOW to all tools (dangerous)."),
+    allow_all: bool = typer.Option(False, "--allow-all", "--yolo", help="Auto-approve ALL tools (dangerous)."),
+    auto_edit: bool = typer.Option(False, "--auto-edit", help="Auto-approve file edits; still ask for shell."),
+    no_checkpoint: bool = typer.Option(False, "--no-checkpoint", help="Disable git checkpoints before edits."),
+    output: str = typer.Option("text", "--output", "-o", help="Output format: text or json (json implies headless)."),
     cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
 ) -> None:
-    """Run CrabKey in agent mode toward a goal."""
-    asyncio.run(_run_async(goal, model, provider, max_iter, no_plan, allow_all, cwd))
+    """Run CrabKey in agent mode toward a goal.
+
+    Headless usage: pipe the goal on stdin (e.g. `echo "fix the bug" | crabkey run`)
+    and/or pass `--output json` for machine-readable results and exit codes.
+    """
+    # Read the goal from stdin when piped and no goal argument was given.
+    if goal is None and not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        goal = piped or None
+
+    if output not in ("text", "json"):
+        raise typer.BadParameter("--output must be 'text' or 'json'.")
+
+    code = asyncio.run(_run_async(
+        goal, model, provider, max_iter, no_plan, allow_all, auto_edit, no_checkpoint, output, cwd
+    ))
+    raise typer.Exit(code)
 
 
 async def _run_async(
@@ -105,8 +230,11 @@ async def _run_async(
     max_iter: int,
     no_plan: bool,
     allow_all: bool,
+    auto_edit: bool,
+    no_checkpoint: bool,
+    output: str,
     cwd: Path,
-) -> None:
+) -> int:
     config_dir, project_config, db_path = _resolve_project(cwd)
 
     if provider_override:
@@ -114,27 +242,88 @@ async def _run_async(
     if model_override:
         project_config.model = model_override
 
+    headless = output == "json"
+
     provider = _make_provider(project_config)
     db = Db(db_path)
     await db.initialize()
 
+    # Extensions bundle MCP servers + context + commands under .crabkey/extensions/.
+    extensions = load_extensions(cwd)
+
     context_file = config_dir / "CONTEXT.md"
-    memory = MemoryManager(context_file=context_file)
-    assembler = ContextAssembler(memory)
+    memory = MemoryManager(
+        context_file=context_file,
+        global_context_file=_GLOBAL_CONTEXT_FILE,
+        extra_context_files=extensions.context_files,
+    )
+    summarizer = _make_summarizer(provider, project_config.model)
+    assembler = ContextAssembler(memory, summarizer=summarizer)
     reflector = Reflector(provider)
     planner = Planner(provider)
+    session_mgr = SessionManager(db)
     thread_mgr = ThreadManager(db)
 
-    broker = PermissionBroker()
-    if allow_all:
-        broker.add_rule(Permission(tool="*", level=PermissionLevel.ALLOW))
-    else:
-        for t in ["file.read", "file.list", "file.write", "file.edit", "shell.run", "web.fetch"]:
-            broker.add_rule(Permission(tool=t, level=PermissionLevel.ALLOW))
+    # In headless mode there is no human to answer prompts, so never use the
+    # interactive approver — ASK-level tools are refused unless --yolo/--auto-edit.
+    broker, approver = _build_broker(allow_all, auto_edit)
+    if headless:
+        approver = None
 
     sandbox = Sandbox(SandboxConfig(allowed_paths=[cwd]))
     tools = default_registry()
     tools.register(ShellTool(sandbox=sandbox))
+    tools.register(SaveMemoryTool(context_file=context_file))
+
+    # Register MCP servers from config ([[mcp_servers]]) plus any from extensions.
+    all_mcp_servers = list(project_config.mcp_servers) + extensions.mcp_servers
+    mcp_clients = await load_mcp_servers(all_mcp_servers, tools)
+    if mcp_clients and not headless:
+        console.print(f"[dim]Connected {len(mcp_clients)} MCP server(s).[/dim]")
+    if extensions.names and not headless:
+        console.print(f"[dim]Loaded extensions: {', '.join(extensions.names)}.[/dim]")
+
+    # Sub-agents declared in config ([agents.*]) become dispatchable via agent.dispatch.
+    agent_router = AgentRouter()
+    for agent_cfg in project_config.agents.values():
+        agent_router.from_config(agent_cfg, provider)
+    agent_names = agent_router.list_agents()
+    if agent_names:
+        # Snapshot current tools as the sub-agent toolset (excludes agent.dispatch
+        # itself, which is registered afterwards — preventing infinite recursion).
+        sub_tools = ToolRegistry()
+        for t in tools:
+            sub_tools.register(t)
+
+        async def _dispatch(agent_name: str, task: str) -> str:
+            agent = agent_router.get(agent_name)
+            sub_thread = await thread_mgr.new(session_id=session_mgr.active.id, name=f"sub:{agent_name}")
+            sub_loop = LoopEngine(
+                provider=agent.provider, tools=sub_tools, assembler=assembler,
+                db=db, broker=broker, config=LoopConfig(max_iterations=8, stream=False),
+                approver=approver,
+            )
+            sub_history = await sub_loop.run(
+                goal=task, thread_id=sub_thread.id, model_config=agent.config, working_dir=str(cwd),
+            )
+            final = next((m.content for m in reversed(sub_history) if m.role == Role.ASSISTANT and m.content), "")
+            return final or "(sub-agent produced no output)"
+
+        tools.register(AgentDispatchTool(_dispatch, agent_names))
+        if not headless:
+            console.print(f"[dim]Sub-agents available: {', '.join(agent_names)}.[/dim]")
+
+    # Checkpoints require a git repo; silently skip if this isn't one.
+    checkpoint: Checkpoint | None = None
+    if not no_checkpoint and (cwd / ".git").exists():
+        checkpoint = Checkpoint(repo_root=cwd)
+
+    hooks = HookDispatcher()
+
+    # Optional tracing: set CRABKEY_TRACE_FILE=path.jsonl and/or CRABKEY_OTEL=1.
+    trace_file = os.environ.get("CRABKEY_TRACE_FILE")
+    if trace_file or os.environ.get("CRABKEY_OTEL") == "1":
+        Telemetry(trace_file=trace_file, otel=os.environ.get("CRABKEY_OTEL") == "1").register(hooks)
 
     model_config = ModelConfig(
         model=project_config.model,
@@ -150,34 +339,74 @@ async def _run_async(
         broker=broker,
         reflector=reflector,
         config=LoopConfig(max_iterations=max_iter),
+        hooks=hooks,
+        checkpoint=checkpoint,
+        approver=approver,
     )
 
     if goal is None:
+        if headless:
+            # Bypass Rich: it soft-wraps and parses [..] markup, corrupting JSON.
+            print(json.dumps({"status": "error", "error": "No goal provided."}))
+            return 2
         goal = Prompt.ask("[bold cyan]Goal[/bold cyan]")
 
-    thread = await thread_mgr.new(name=goal[:60])
-    console.print()
-    console.print(Panel(
-        f"[bold]{goal}[/bold]",
-        title="[bold cyan]Goal[/bold cyan]",
-        border_style="cyan",
-        padding=(1, 2),
-    ))
+    # A thread forks from a session, so create the session first.
+    session = await session_mgr.new(name=goal[:60])
+    thread = await thread_mgr.new(session_id=session.id, name=goal[:60])
+
+    if not headless:
+        console.print()
+        console.print(Panel(
+            f"[bold]{goal}[/bold]",
+            title="[bold cyan]Goal[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 2),
+        ))
 
     if not no_plan:
-        console.print()
-        ui.section_header(console, "Planning", "▸")
-        with ui.spinner_status(console, "Generating plan…"):
+        if headless:
             plan = await planner.plan(goal)
-        if plan.steps:
-            lines = "\n".join(f"[bold]{s.index}.[/bold] {s.description}" + (f" [dim][{s.tool_hint}][/dim]" if s.tool_hint else "") for s in plan.steps)
-            console.print(Panel(Markdown(lines), title="[bold]Plan[/bold]", border_style="yellow", padding=(1, 2)))
+        else:
+            console.print()
+            ui.section_header(console, "Planning", "▸")
+            with ui.spinner_status(console, "Generating plan…"):
+                plan = await planner.plan(goal)
+            if plan.steps:
+                lines = "\n".join(f"[bold]{s.index}.[/bold] {s.description}" + (f" [dim][{s.tool_hint}][/dim]" if s.tool_hint else "") for s in plan.steps)
+                console.print(Panel(Markdown(lines), title="[bold]Plan[/bold]", border_style="yellow", padding=(1, 2)))
 
-    console.print()
-    ui.section_header(console, "Execution", "▸")
-    console.print()
+    if not headless:
+        console.print()
+        ui.section_header(console, "Execution", "▸")
+        console.print()
+
+    # Collected for JSON output; ignored in text mode.
+    collected: list[dict] = []
+    saw_error = {"value": False}
+
+    # Tracks whether we're mid-stream so we can flush a newline before the next
+    # non-delta event (tool call / done) renders.
+    stream_state = {"active": False}
+
+    def _end_stream() -> None:
+        if stream_state["active"]:
+            console.file.write("\n")
+            console.file.flush()
+            stream_state["active"] = False
 
     def on_event(evt: StepEvent) -> None:
+        if evt.kind == "error":
+            saw_error["value"] = True
+        if headless:
+            collected.append({"kind": evt.kind, "tool": evt.tool_name, "data": evt.data, "iteration": evt.iteration})
+            return
+        if evt.kind == "text_delta":
+            console.file.write(evt.data)
+            console.file.flush()
+            stream_state["active"] = True
+            return
+        _end_stream()
         if evt.kind == "text" and evt.data:
             console.print(Markdown(evt.data))
         elif evt.kind == "tool_call":
@@ -191,24 +420,40 @@ async def _run_async(
         elif evt.kind == "error":
             console.print(f"[red]✗[/red] {evt.data}")
 
-    await loop.run(goal=goal, thread_id=thread.id, model_config=model_config, working_dir=str(cwd), on_event=on_event)
+    exit_code = 0
+    try:
+        history = await loop.run(goal=goal, thread_id=thread.id, model_config=model_config, working_dir=str(cwd), on_event=on_event)
+    except Exception as exc:
+        if headless:
+            print(json.dumps({"status": "error", "error": str(exc), "thread_id": thread.id}))
+        else:
+            console.print(f"[red]✗[/red] {exc}")
+        return 1
+    finally:
+        for client in mcp_clients:
+            await client.stop()
 
     total_in, total_out = await db.total_cost_tokens(thread.id)
+
+    if headless:
+        final_text = next(
+            (m.content for m in reversed(history) if m.role == Role.ASSISTANT and m.content),
+            "",
+        )
+        print(json.dumps({
+            "status": "error" if saw_error["value"] else "ok",
+            "goal": goal,
+            "thread_id": thread.id,
+            "result": final_text,
+            "events": collected,
+            "tokens": {"input": total_in, "output": total_out},
+        }))
+        return 1 if saw_error["value"] else 0
+
     console.print(f"\n[dim]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim]")
     console.print(f"[dim]Tokens: {total_in:,} in · {total_out:,} out · thread {thread.id[:8]}[/dim]")
     console.print()
-
-
-@app.command()
-def tui(
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
-    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
-) -> None:
-    """Launch the beautiful Ink (React) terminal UI."""
-    from .launcher import launch_tui
-
-    raise typer.Exit(launch_tui(cwd, provider, model))
+    return exit_code
 
 
 @app.command()
@@ -223,9 +468,49 @@ async def _list_threads(cwd: Path) -> None:
     _, _, db_path = _resolve_project(cwd)
     db = Db(db_path)
     await db.initialize()
-    thread_mgr = ThreadManager(db)
-    for t in thread_mgr.list():
-        console.print(f"  {t.id[:8]}  {t.name}")
+    found = False
+    for session in await db.list_sessions():
+        for t in await db.list_threads_for_session(session.id):
+            found = True
+            console.print(f"  {t.id[:8]}  [dim]{session.name}[/dim]  {t.name}")
+    if not found:
+        console.print("[dim]No threads yet.[/dim]")
+
+
+@app.command()
+def restore(
+    sha: Optional[str] = typer.Argument(None, help="Checkpoint SHA to restore. Omit to list checkpoints."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+) -> None:
+    """List CrabKey git checkpoints, or restore the workspace to one (hard reset)."""
+    asyncio.run(_restore_async(sha, cwd))
+
+
+async def _restore_async(sha: str | None, cwd: Path) -> None:
+    if not (cwd / ".git").exists():
+        ui.error_message(console, f"{cwd} is not a git repository — no checkpoints available.")
+        raise typer.Exit(1)
+
+    ckpt = Checkpoint(repo_root=cwd)
+    checkpoints = await ckpt.list()
+
+    if sha is None:
+        if not checkpoints:
+            console.print("[dim]No CrabKey checkpoints found.[/dim]")
+            return
+        console.print()
+        ui.section_header(console, "Checkpoints", "▸")
+        for info in checkpoints:
+            console.print(f"  [cyan]{info.sha[:8]}[/cyan]  {info.label}")
+        console.print("\n[dim]Restore with: crabkey restore <sha>[/dim]\n")
+        return
+
+    match = next((c for c in checkpoints if c.sha.startswith(sha)), None)
+    if match is None:
+        ui.error_message(console, f"No checkpoint matching {sha!r}. Run 'crabkey restore' to list them.")
+        raise typer.Exit(1)
+    await ckpt.restore(match)
+    console.print(f"[green]✓[/green] Restored workspace to [cyan]{match.sha[:8]}[/cyan] ({match.label})")
 
 
 @app.command(name="providers")
@@ -293,84 +578,6 @@ def configure(
     """Interactive wizard to select a provider, set an API key, and pick a model."""
     from .configure import run_configure
     run_configure(cwd, global_config=global_)
-
-
-@app.command()
-def chat(
-    session: Optional[str] = typer.Option(None, "--session", "-s", help="Session name to resume or create."),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
-    allow_all: bool = typer.Option(False, "--allow-all", help="Grant ALLOW to all tools."),
-    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
-) -> None:
-    """Start an interactive chat session with session and thread support."""
-    asyncio.run(_chat_async(session, model, provider, allow_all, cwd))
-
-
-async def _chat_async(
-    session_name: str | None,
-    model_override: str | None,
-    provider_override: str | None,
-    allow_all: bool,
-    cwd: Path,
-) -> None:
-    from .repl import ConversationContext, Repl
-
-    config_dir, project_config, db_path = _resolve_project(cwd)
-
-    if provider_override:
-        project_config.provider = provider_override
-    if model_override:
-        project_config.model = model_override
-
-    provider = _make_provider(project_config)
-
-    # Pre-flight: warn immediately if the API key is missing rather than
-    # letting the first message fail with a cryptic 401.
-    missing = provider.missing_key()
-    if missing:
-        ui.warning_message(
-            console,
-            f"{missing} is not set. Run [bold]crabkey configure[/bold] or set [bold]{missing}=your-key[/bold]"
-        )
-
-    db = Db(db_path)
-    await db.initialize()
-
-    session_mgr = SessionManager(db)
-    thread_mgr = ThreadManager(db)
-
-    # Resume or create a session
-    if session_name:
-        try:
-            await session_mgr.switch(session_name)
-            console.print(f"[dim]Resumed session [cyan]{session_name}[/cyan][/dim]")
-        except KeyError:
-            sess = await session_mgr.new(session_name)
-            console.print(f"[dim]Created session [cyan]{sess.name}[/cyan][/dim]")
-    else:
-        sess = await session_mgr.new()
-        console.print(f"[dim]Started session [cyan]{sess.name}[/cyan]  — use /session new <name> to name it[/dim]")
-
-    model_config = ModelConfig(
-        model=project_config.model,
-        max_tokens=project_config.max_tokens,
-        system=(
-            "You are CrabKey, an agentic coding assistant. "
-            "Be concise, precise, and helpful."
-        ),
-    )
-
-    ctx = ConversationContext(session_mgr, thread_mgr, db)
-    repl = Repl(
-        ctx=ctx,
-        session_mgr=session_mgr,
-        thread_mgr=thread_mgr,
-        provider=provider,
-        model_config=model_config,
-        console=console,
-    )
-    await repl.run()
 
 
 def main() -> None:

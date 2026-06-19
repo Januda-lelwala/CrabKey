@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from typing import Callable
 
 
 class PermissionLevel(enum.Enum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
+
+
+class ApprovalDecision(enum.Enum):
+    """User's answer to an interactive approval prompt."""
+    ALLOW_ONCE = "allow_once"        # permit this call only
+    ALLOW_ALWAYS = "allow_always"    # permit this call and add a session ALLOW rule
+    DENY = "deny"                    # reject this call
+
+
+# Called when a tool resolves to ASK and an interactive approver is available.
+# Receives the tool name and a representative argument (path/command), returns
+# the user's decision.
+Approver = Callable[[str, "str | None"], ApprovalDecision]
 
 
 @dataclass
@@ -38,13 +52,24 @@ class PermissionBroker:
                 return rule.level
         return PermissionLevel.ASK
 
-    def require(self, tool: str, arg: str | None = None) -> None:
+    def require(self, tool: str, arg: str | None = None, on_ask: Approver | None = None) -> None:
         level = self.check(tool, arg)
         if level == PermissionLevel.DENY:
             raise PermissionError(f"Tool '{tool}' denied by permission policy (arg={arg!r})")
-        if level == PermissionLevel.ASK:
-            # In a real CLI this prompts the user; here we raise for now.
+        if level != PermissionLevel.ASK:
+            return
+
+        if on_ask is None:
+            # No interactive approver wired — preserve the conservative default
+            # of refusing rather than silently permitting.
             raise PermissionError(
                 f"Tool '{tool}' requires user confirmation (arg={arg!r}). "
                 "Grant permission with broker.add_rule()."
             )
+
+        decision = on_ask(tool, arg)
+        if decision == ApprovalDecision.DENY:
+            raise PermissionError(f"Tool '{tool}' denied by user (arg={arg!r})")
+        if decision == ApprovalDecision.ALLOW_ALWAYS:
+            # Remember for the rest of the session so we stop asking for this tool.
+            self.add_rule(Permission(tool=tool, level=PermissionLevel.ALLOW))
