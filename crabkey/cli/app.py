@@ -22,6 +22,8 @@ from ..mal.message import Message, Role
 from ..mal.plugin_provider import PluginModelProvider
 from ..mal.provider import ModelConfig
 from ..mal.provider_registry import get_provider_profile, list_providers
+from ..observability import Telemetry
+from ..orchestration.agent_router import AgentRouter
 from ..orchestration.hook_dispatcher import HookDispatcher
 from ..orchestration.loop_engine import LoopConfig, LoopEngine, StepEvent
 from ..orchestration.planner import Planner
@@ -38,7 +40,8 @@ from ..safety.permission_broker import (
     PermissionLevel,
 )
 from ..safety.sandbox import Sandbox, SandboxConfig
-from ..tools import default_registry, load_mcp_servers
+from ..tools import ToolRegistry, default_registry, load_mcp_servers
+from ..tools.agent_tool import AgentDispatchTool
 from ..tools.memory_tool import SaveMemoryTool
 from ..tools.shell_tool import ShellTool
 from . import ui
@@ -71,9 +74,10 @@ def _make_summarizer(provider: PluginModelProvider, model: str):
     return summarize
 
 # Tools that never mutate the workspace — always safe to auto-approve.
+# agent.dispatch is a meta-tool; the sub-agent's own actions are gated separately.
 _READONLY_TOOLS = (
     "file.read", "file.list", "search.grep", "search.glob",
-    "web.fetch", "web.search", "memory.save",
+    "web.fetch", "web.search", "memory.save", "agent.dispatch",
 )
 # Tools that change files — auto-approved in auto-edit mode, asked otherwise.
 _EDIT_TOOLS = ("file.write", "file.edit")
@@ -264,12 +268,47 @@ async def _run_async(
     if extensions.names and not headless:
         console.print(f"[dim]Loaded extensions: {', '.join(extensions.names)}.[/dim]")
 
+    # Sub-agents declared in config ([agents.*]) become dispatchable via agent.dispatch.
+    agent_router = AgentRouter()
+    for agent_cfg in project_config.agents.values():
+        agent_router.from_config(agent_cfg, provider)
+    agent_names = agent_router.list_agents()
+    if agent_names:
+        # Snapshot current tools as the sub-agent toolset (excludes agent.dispatch
+        # itself, which is registered afterwards — preventing infinite recursion).
+        sub_tools = ToolRegistry()
+        for t in tools:
+            sub_tools.register(t)
+
+        async def _dispatch(agent_name: str, task: str) -> str:
+            agent = agent_router.get(agent_name)
+            sub_thread = await thread_mgr.new(session_id=session_mgr.active.id, name=f"sub:{agent_name}")
+            sub_loop = LoopEngine(
+                provider=agent.provider, tools=sub_tools, assembler=assembler,
+                db=db, broker=broker, config=LoopConfig(max_iterations=8, stream=False),
+                approver=approver,
+            )
+            sub_history = await sub_loop.run(
+                goal=task, thread_id=sub_thread.id, model_config=agent.config, working_dir=str(cwd),
+            )
+            final = next((m.content for m in reversed(sub_history) if m.role == Role.ASSISTANT and m.content), "")
+            return final or "(sub-agent produced no output)"
+
+        tools.register(AgentDispatchTool(_dispatch, agent_names))
+        if not headless:
+            console.print(f"[dim]Sub-agents available: {', '.join(agent_names)}.[/dim]")
+
     # Checkpoints require a git repo; silently skip if this isn't one.
     checkpoint: Checkpoint | None = None
     if not no_checkpoint and (cwd / ".git").exists():
         checkpoint = Checkpoint(repo_root=cwd)
 
     hooks = HookDispatcher()
+
+    # Optional tracing: set CRABKEY_TRACE_FILE=path.jsonl and/or CRABKEY_OTEL=1.
+    trace_file = os.environ.get("CRABKEY_TRACE_FILE")
+    if trace_file or os.environ.get("CRABKEY_OTEL") == "1":
+        Telemetry(trace_file=trace_file, otel=os.environ.get("CRABKEY_OTEL") == "1").register(hooks)
 
     model_config = ModelConfig(
         model=project_config.model,
