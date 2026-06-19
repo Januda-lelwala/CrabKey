@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, AsyncIterator, Callable
 
 from .message import CompletionResponse, Message, Role, ToolCall, ToolResult, Usage
@@ -30,6 +31,21 @@ _STOP_REASON_MAP = {
     "length": "max_tokens",
     "content_filter": "refusal",
 }
+
+# OpenAI and Anthropic both require tool/function names to match ^[a-zA-Z0-9_-]+$,
+# but CrabKey names tools with dots (e.g. "file.read"). Sanitize on the way out
+# and map back on the way in so the dotted names stay internal.
+_INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _sanitize_tool_name(name: str) -> str:
+    return _INVALID_NAME_CHARS.sub("_", name)
+
+
+def _remap_tool_call_names(tool_calls: list[ToolCall], name_map: dict[str, str]) -> None:
+    """Restore original (dotted) tool names from their sanitized wire forms."""
+    for tc in tool_calls:
+        tc.name = name_map.get(tc.name, tc.name)
 
 
 async def _accumulate_openai_stream(
@@ -159,7 +175,7 @@ def _messages_to_openai_wire(messages: list[Message]) -> list[dict[str, Any]]:
                 wire.append({
                     "role": "tool",
                     "tool_call_id": r.tool_call_id,
-                    "tool_name": r.name,
+                    "tool_name": _sanitize_tool_name(r.name),
                     "content": r.content,
                 })
         elif m.tool_calls:
@@ -170,7 +186,7 @@ def _messages_to_openai_wire(messages: list[Message]) -> list[dict[str, Any]]:
                 {
                     "id": tc.id,
                     "type": "function",
-                    "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                    "function": {"name": _sanitize_tool_name(tc.name), "arguments": json.dumps(tc.arguments)},
                 }
                 for tc in m.tool_calls
             ]
@@ -254,13 +270,20 @@ class PluginModelProvider(ModelProvider):
             {
                 "type": "function",
                 "function": {
-                    "name": t.name,
+                    "name": _sanitize_tool_name(t.name),
                     "description": t.description,
                     "parameters": t.parameters,
                 },
             }
             for t in tools
         ]
+
+    @staticmethod
+    def _name_map(tools: list[ToolSchema] | None) -> dict[str, str]:
+        """Map sanitized wire names back to the original (dotted) tool names."""
+        if not tools:
+            return {}
+        return {_sanitize_tool_name(t.name): t.name for t in tools}
 
     def _base_params(self, config: ModelConfig, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         """Build the common params dict passed to every transport.build_kwargs() call."""
@@ -306,7 +329,9 @@ class PluginModelProvider(ModelProvider):
             raw = await client.chat.completions.create(**kwargs)
 
         normalized = self._transport.normalize_response(raw)
-        return _normalized_to_completion(normalized, config.model)
+        completion = _normalized_to_completion(normalized, config.model)
+        _remap_tool_call_names(completion.message.tool_calls, self._name_map(tools))
+        return completion
 
     async def stream(
         self,
@@ -374,6 +399,7 @@ class PluginModelProvider(ModelProvider):
             **params,
         )
 
+        name_map = self._name_map(tools)
         if self._profile.api_mode == "anthropic_messages":
             async with client.messages.stream(**kwargs) as stream_ctx:
                 async for text in stream_ctx.text_stream:
@@ -381,11 +407,14 @@ class PluginModelProvider(ModelProvider):
                         on_text(text)
                 final = await stream_ctx.get_final_message()
             normalized = self._transport.normalize_response(final)
-            return _normalized_to_completion(normalized, config.model)
+            completion = _normalized_to_completion(normalized, config.model)
+        else:
+            kwargs["stream"] = True
+            stream = await client.chat.completions.create(**kwargs)
+            completion = await _accumulate_openai_stream(stream, config.model, on_text)
 
-        kwargs["stream"] = True
-        stream = await client.chat.completions.create(**kwargs)
-        return await _accumulate_openai_stream(stream, config.model, on_text)
+        _remap_tool_call_names(completion.message.tool_calls, name_map)
+        return completion
 
     def count_tokens(self, messages: list[Message], config: ModelConfig) -> int:
         total = sum(len(m.content or "") for m in messages)

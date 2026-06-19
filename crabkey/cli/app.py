@@ -242,6 +242,7 @@ async def _run_async(
     assembler = ContextAssembler(memory, summarizer=summarizer)
     reflector = Reflector(provider)
     planner = Planner(provider)
+    session_mgr = SessionManager(db)
     thread_mgr = ThreadManager(db)
 
     # In headless mode there is no human to answer prompts, so never use the
@@ -291,11 +292,14 @@ async def _run_async(
 
     if goal is None:
         if headless:
-            console.print(json.dumps({"status": "error", "error": "No goal provided."}))
+            # Bypass Rich: it soft-wraps and parses [..] markup, corrupting JSON.
+            print(json.dumps({"status": "error", "error": "No goal provided."}))
             return 2
         goal = Prompt.ask("[bold cyan]Goal[/bold cyan]")
 
-    thread = await thread_mgr.new(name=goal[:60])
+    # A thread forks from a session, so create the session first.
+    session = await session_mgr.new(name=goal[:60])
+    thread = await thread_mgr.new(session_id=session.id, name=goal[:60])
 
     if not headless:
         console.print()
@@ -367,7 +371,7 @@ async def _run_async(
         history = await loop.run(goal=goal, thread_id=thread.id, model_config=model_config, working_dir=str(cwd), on_event=on_event)
     except Exception as exc:
         if headless:
-            console.print(json.dumps({"status": "error", "error": str(exc), "thread_id": thread.id}))
+            print(json.dumps({"status": "error", "error": str(exc), "thread_id": thread.id}))
         else:
             console.print(f"[red]✗[/red] {exc}")
         return 1
@@ -382,7 +386,7 @@ async def _run_async(
             (m.content for m in reversed(history) if m.role == Role.ASSISTANT and m.content),
             "",
         )
-        console.print(json.dumps({
+        print(json.dumps({
             "status": "error" if saw_error["value"] else "ok",
             "goal": goal,
             "thread_id": thread.id,
@@ -422,9 +426,13 @@ async def _list_threads(cwd: Path) -> None:
     _, _, db_path = _resolve_project(cwd)
     db = Db(db_path)
     await db.initialize()
-    thread_mgr = ThreadManager(db)
-    for t in thread_mgr.list():
-        console.print(f"  {t.id[:8]}  {t.name}")
+    found = False
+    for session in await db.list_sessions():
+        for t in await db.list_threads_for_session(session.id):
+            found = True
+            console.print(f"  {t.id[:8]}  [dim]{session.name}[/dim]  {t.name}")
+    if not found:
+        console.print("[dim]No threads yet.[/dim]")
 
 
 @app.command()
