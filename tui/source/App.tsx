@@ -3,10 +3,14 @@ import {Box, Static, Text, useApp, useInput} from 'ink';
 import {Bridge, type BridgeEvent, type ReadyEvent} from './backend.js';
 import {Message, type ChatItem} from './components/Message.js';
 import {Prompt} from './components/Prompt.js';
+import {CommandPalette} from './components/CommandPalette.js';
 import {StatusBar} from './components/StatusBar.js';
+import {SLASH_COMMANDS, type SlashCommand, expand, filterCommands} from './commands.js';
 import {theme} from './theme.js';
 
 type Status = 'idle' | 'thinking' | 'tool';
+
+type CustomCommand = {name: string; description: string; prompt: string};
 
 // Omit must distribute over the ChatItem union so each variant keeps its keys.
 type NewChatItem = ChatItem extends infer T
@@ -17,10 +21,13 @@ type NewChatItem = ChatItem extends infer T
 
 const HELP = [
 	'Slash commands:',
-	'  /help          show this help',
-	'  /clear         clear the conversation',
-	'  /quit, /exit   leave CrabKey',
+	'  /help                       show this help',
+	'  /session new|list|switch    manage sessions',
+	'  /thread  new|list|exit      manage threads (fork the conversation)',
+	'  /clear                      clear the conversation',
+	'  /quit, /exit                leave CrabKey',
 	'',
+	'Type / to browse commands; keep typing to filter. ↑/↓ to select, Enter to run.',
 	'Tips: Esc cancels the current input · Ctrl+C exits.',
 ].join('\n');
 
@@ -32,14 +39,38 @@ export function App(): React.ReactElement {
 
 	const [items, setItems] = useState<ChatItem[]>([]);
 	const [input, setInput] = useState('');
+	const [selected, setSelected] = useState(0);
 	const [status, setStatus] = useState<Status>('idle');
 	const [activeTool, setActiveTool] = useState<string | undefined>();
 	const [busy, setBusy] = useState(false);
 	const [ready, setReady] = useState<ReadyEvent | null>(null);
 	const [tokens, setTokens] = useState({in: 0, out: 0});
+	const [customCommands, setCustomCommands] = useState<CustomCommand[]>([]);
+	const [session, setSession] = useState<string | undefined>();
+	const [thread, setThread] = useState<string | undefined>();
 
 	const push = (item: NewChatItem) =>
 		setItems(prev => [...prev, {...item, id: make()} as ChatItem]);
+
+	// Built-in commands plus any custom commands the engine reported.
+	const allCommands: SlashCommand[] = useMemo(
+		() => [
+			...SLASH_COMMANDS,
+			...customCommands.map(c => ({name: c.name, description: c.description})),
+		],
+		[customCommands],
+	);
+
+	// Command palette: open while typing a slash command (before any space/args).
+	const paletteOpen = !busy && input.startsWith('/') && !input.includes(' ');
+	const matches = useMemo(
+		() => (paletteOpen ? filterCommands(input.slice(1), allCommands) : []),
+		[paletteOpen, input, allCommands],
+	);
+	// Reset the highlight to the top whenever the query changes.
+	useEffect(() => {
+		setSelected(0);
+	}, [input]);
 
 	useEffect(() => {
 		const onEvent = (evt: BridgeEvent) => {
@@ -47,6 +78,8 @@ export function App(): React.ReactElement {
 				case 'ready': {
 					const r = evt as unknown as ReadyEvent;
 					setReady(r);
+					const cmds = (evt['commands'] ?? []) as CustomCommand[];
+					setCustomCommands(cmds);
 					push({
 						role: 'banner',
 						provider: r.provider,
@@ -114,6 +147,13 @@ export function App(): React.ReactElement {
 					setStatus('idle');
 					setBusy(false);
 					break;
+				case 'info':
+					push({role: 'info', text: String(evt['data'] ?? '')});
+					break;
+				case 'state':
+					setSession((evt['session'] as string) ?? undefined);
+					setThread((evt['thread'] as string) ?? undefined);
+					break;
 				default:
 					break;
 			}
@@ -142,7 +182,18 @@ export function App(): React.ReactElement {
 	};
 
 	useInput((_input, key) => {
-		if (key.escape && !busy) setInput('');
+		if (key.escape && !busy) {
+			setInput('');
+			return;
+		}
+		// Navigate the command palette with the arrow keys while it is open.
+		if (paletteOpen && matches.length > 0) {
+			if (key.downArrow) {
+				setSelected(s => (s + 1) % matches.length);
+			} else if (key.upArrow) {
+				setSelected(s => (s - 1 + matches.length) % matches.length);
+			}
+		}
 	});
 
 	const handleSubmit = (raw: string) => {
@@ -151,7 +202,18 @@ export function App(): React.ReactElement {
 		if (!text) return;
 
 		if (text.startsWith('/')) {
-			const cmd = text.slice(1).toLowerCase();
+			const parts = text.slice(1).split(/\s+/);
+			let cmd = (parts[0] ?? '').toLowerCase();
+			const rest = parts.slice(1);
+			// If no args were typed, Enter runs the highlighted palette match,
+			// so `/he` + Enter runs `help`.
+			if (rest.length === 0) {
+				const m = filterCommands(parts[0] ?? '', allCommands);
+				if (m.length > 0) {
+					cmd = m[Math.min(selected, m.length - 1)]!.name;
+				}
+			}
+
 			if (cmd === 'quit' || cmd === 'exit' || cmd === 'q') {
 				quit();
 				return;
@@ -162,6 +224,22 @@ export function App(): React.ReactElement {
 			}
 			if (cmd === 'help') {
 				push({role: 'info', text: HELP});
+				return;
+			}
+			if (cmd === 'session' || cmd === 'thread') {
+				bridge.send({
+					type: cmd,
+					action: rest[0],
+					name: rest.slice(1).join(' ') || undefined,
+				});
+				return;
+			}
+			const custom = customCommands.find(c => c.name === cmd);
+			if (custom) {
+				push({role: 'user', text});
+				setBusy(true);
+				setStatus('thinking');
+				bridge.prompt(expand(custom.prompt, rest.join(' ')));
 				return;
 			}
 			push({role: 'info', text: `Unknown command: /${cmd} — try /help`});
@@ -196,12 +274,17 @@ export function App(): React.ReactElement {
 					onSubmit={handleSubmit}
 					disabled={busy}
 				/>
+				{paletteOpen && (
+					<CommandPalette commands={matches} selected={selected} />
+				)}
 				<StatusBar
 					status={status}
 					activeTool={activeTool}
 					tokensIn={tokens.in}
 					tokensOut={tokens.out}
 					model={ready.model}
+					session={session}
+					thread={thread}
 				/>
 			</Box>
 		</Box>

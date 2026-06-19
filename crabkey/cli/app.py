@@ -45,7 +45,6 @@ from ..tools.agent_tool import AgentDispatchTool
 from ..tools.memory_tool import SaveMemoryTool
 from ..tools.shell_tool import ShellTool
 from . import ui
-from .commands import load_custom_commands
 from .extensions import load_extensions
 
 _GLOBAL_CONTEXT_FILE = Path.home() / ".config" / "crabkey" / "CONTEXT.md"
@@ -84,10 +83,26 @@ _EDIT_TOOLS = ("file.write", "file.edit")
 
 app = typer.Typer(
     name="crabkey",
-    help="Model-agnostic agentic coding CLI.",
+    help="Model-agnostic agentic coding CLI. Run `crabkey` with no command to open the interactive UI.",
     add_completion=False,
+    no_args_is_help=False,
 )
 console = Console()
+
+
+@app.callback(invoke_without_command=True)
+def _default(
+    ctx: typer.Context,
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
+) -> None:
+    """Open the interactive CrabKey UI when invoked with no subcommand."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from .launcher import launch_tui
+
+    raise typer.Exit(launch_tui(cwd, provider, model))
 
 _CRABKEY_ENV_FILE = Path.home() / ".config" / "crabkey" / "env"
 
@@ -442,18 +457,6 @@ async def _run_async(
 
 
 @app.command()
-def tui(
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
-    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
-) -> None:
-    """Launch the beautiful Ink (React) terminal UI."""
-    from .launcher import launch_tui
-
-    raise typer.Exit(launch_tui(cwd, provider, model))
-
-
-@app.command()
 def threads(
     cwd: Path = typer.Option(Path.cwd(), "--cwd"),
 ) -> None:
@@ -575,93 +578,6 @@ def configure(
     """Interactive wizard to select a provider, set an API key, and pick a model."""
     from .configure import run_configure
     run_configure(cwd, global_config=global_)
-
-
-@app.command()
-def chat(
-    session: Optional[str] = typer.Option(None, "--session", "-s", help="Session name to resume or create."),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the model."),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Override the provider."),
-    allow_all: bool = typer.Option(False, "--allow-all", help="Grant ALLOW to all tools."),
-    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Project root directory."),
-) -> None:
-    """Start an interactive chat session with session and thread support."""
-    asyncio.run(_chat_async(session, model, provider, allow_all, cwd))
-
-
-async def _chat_async(
-    session_name: str | None,
-    model_override: str | None,
-    provider_override: str | None,
-    allow_all: bool,
-    cwd: Path,
-) -> None:
-    from .repl import ConversationContext, Repl
-
-    config_dir, project_config, db_path = _resolve_project(cwd)
-
-    if provider_override:
-        project_config.provider = provider_override
-    if model_override:
-        project_config.model = model_override
-
-    provider = _make_provider(project_config)
-
-    # Pre-flight: warn immediately if the API key is missing rather than
-    # letting the first message fail with a cryptic 401.
-    missing = provider.missing_key()
-    if missing:
-        ui.warning_message(
-            console,
-            f"{missing} is not set. Run [bold]crabkey configure[/bold] or set [bold]{missing}=your-key[/bold]"
-        )
-
-    db = Db(db_path)
-    await db.initialize()
-
-    session_mgr = SessionManager(db)
-    thread_mgr = ThreadManager(db)
-
-    # Resume or create a session
-    if session_name:
-        try:
-            await session_mgr.switch(session_name)
-            console.print(f"[dim]Resumed session [cyan]{session_name}[/cyan][/dim]")
-        except KeyError:
-            sess = await session_mgr.new(session_name)
-            console.print(f"[dim]Created session [cyan]{sess.name}[/cyan][/dim]")
-    else:
-        sess = await session_mgr.new()
-        console.print(f"[dim]Started session [cyan]{sess.name}[/cyan]  — use /session new <name> to name it[/dim]")
-
-    model_config = ModelConfig(
-        model=project_config.model,
-        max_tokens=project_config.max_tokens,
-        system=(
-            "You are CrabKey, an agentic coding assistant. "
-            "Be concise, precise, and helpful."
-        ),
-    )
-
-    # Discover custom slash commands: global, then extensions, then project
-    # (later dirs override earlier ones on name collision).
-    extensions = load_extensions(cwd)
-    command_dirs = [_GLOBAL_COMMANDS_DIR, *extensions.command_dirs, config_dir / "commands"]
-    custom_commands = load_custom_commands(command_dirs)
-    if custom_commands:
-        console.print(f"[dim]Loaded {len(custom_commands)} custom command(s). Type /help to see them.[/dim]")
-
-    ctx = ConversationContext(session_mgr, thread_mgr, db)
-    repl = Repl(
-        ctx=ctx,
-        session_mgr=session_mgr,
-        thread_mgr=thread_mgr,
-        provider=provider,
-        model_config=model_config,
-        console=console,
-        custom_commands=custom_commands,
-    )
-    await repl.run()
 
 
 def main() -> None:

@@ -9,6 +9,8 @@ type Props = {
 	tokensIn: number;
 	tokensOut: number;
 	model: string;
+	session?: string;
+	thread?: string;
 };
 
 const fmt = (n: number): string =>
@@ -20,7 +22,12 @@ export function StatusBar({
 	tokensIn,
 	tokensOut,
 	model,
+	session,
+	thread,
 }: Props): React.ReactElement {
+	const context = [session && `session:${session}`, thread && `thread:${thread}`]
+		.filter(Boolean)
+		.join(' · ');
 	return (
 		<Box justifyContent="space-between" paddingX={1}>
 			<Box>
@@ -34,6 +41,7 @@ export function StatusBar({
 							: 'thinking…'}
 					</Text>
 				)}
+				{context ? <Text color={theme.dim}>{'  ' + context}</Text> : null}
 			</Box>
 			<Box>
 				<Text color={theme.dim}>

@@ -41,6 +41,7 @@ class StepEvent:
     data: str = ""
     tool_name: str | None = None
     iteration: int = 0
+    is_error: bool = False      # set on "tool_result" events when the tool failed
 
 
 class LoopEngine:
@@ -80,8 +81,11 @@ class LoopEngine:
         model_config: ModelConfig,
         working_dir: str,
         on_event: Callable[[StepEvent], None] | None = None,
+        history: list[Message] | None = None,
     ) -> list[Message]:
-        history: list[Message] = []
+        # When a history list is passed in it is reused and mutated, so the caller
+        # can carry a multi-turn conversation across run() calls (e.g. the TUI).
+        history = history if history is not None else []
         history.append(Message(role=Role.USER, content=goal))
         tool_ctx = ToolContext(working_dir=working_dir)
 
@@ -165,7 +169,7 @@ class LoopEngine:
                 output = f"Error: {exc}"
                 is_error = True
             if on_event:
-                on_event(StepEvent(kind="tool_result", tool_name=tc.name, data=output, iteration=iteration))
+                on_event(StepEvent(kind="tool_result", tool_name=tc.name, data=output, iteration=iteration, is_error=is_error))
             await self._fire(HookEvent.POST_TOOL, {"tool": tc.name, "output": output, "is_error": is_error})
             results.append(ToolResult(tool_call_id=tc.id, name=tc.name, content=output, is_error=is_error))
         return results

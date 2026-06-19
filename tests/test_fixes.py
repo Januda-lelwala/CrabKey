@@ -48,6 +48,53 @@ def test_remap_leaves_unknown_names_untouched():
     assert calls[0].name == "mystery_tool"
 
 
+async def test_loop_run_continues_passed_history():
+    """The TUI passes a persistent history list across turns; run() must reuse
+    and extend it rather than starting fresh."""
+    from crabkey.mal.message import CompletionResponse, Message, Role, Usage
+    from crabkey.mal.provider import ModelConfig
+    from crabkey.orchestration.loop_engine import LoopConfig, LoopEngine
+    from crabkey.safety.permission_broker import Permission, PermissionBroker, PermissionLevel
+    from crabkey.tools.base import ToolRegistry
+
+    class _Provider:
+        name = "fake"
+
+        async def complete(self, messages, config, tools=None):
+            return CompletionResponse(
+                message=Message(role=Role.ASSISTANT, content="ok"),
+                usage=Usage(), model="fake", stop_reason="end_turn",
+            )
+
+    class _Assembler:
+        async def build(self, history, base_system=None, **kw):
+            return list(history)
+
+    class _Db:
+        async def log_cost(self, *a, **k):
+            return None
+
+    broker = PermissionBroker()
+    broker.add_rule(Permission(tool="*", level=PermissionLevel.ALLOW))
+    loop = LoopEngine(
+        provider=_Provider(), tools=ToolRegistry(), assembler=_Assembler(),
+        db=_Db(), broker=broker, config=LoopConfig(max_iterations=2, stream=False),
+    )
+
+    prior = [
+        Message(role=Role.USER, content="first question"),
+        Message(role=Role.ASSISTANT, content="first answer"),
+    ]
+    returned = await loop.run(
+        goal="second question", thread_id="t", model_config=ModelConfig(model="fake"),
+        working_dir="/tmp", history=prior,
+    )
+    # Same list object, prior turns preserved, new turn appended.
+    assert returned is prior
+    assert prior[0].content == "first question"
+    assert any(m.role == Role.USER and m.content == "second question" for m in prior)
+
+
 def test_messages_wire_sanitizes_tool_call_and_result_names():
     history = [
         Message(role=Role.ASSISTANT, content="", tool_calls=[
